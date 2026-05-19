@@ -961,5 +961,4 @@ def update_task_status(task_id):
     return jsonify({"success": True})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(port=5000, debug=True)
