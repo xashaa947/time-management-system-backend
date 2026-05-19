@@ -460,7 +460,8 @@ def google_callback():
         }
         user_json = json.dumps(frontend_user)
         encoded_user = urllib.parse.quote(user_json)
-        return redirect(f"http://localhost:3000/?auth_data={encoded_user}")
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        return redirect(f"{frontend_url}/?auth_data={encoded_user}")
     else:
         return jsonify({"error": "Google login failed, no email found"})
 
