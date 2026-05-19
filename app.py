@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, url_for, session, redirect
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
@@ -19,6 +20,8 @@ os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
 app = Flask(__name__)
+# Fix HTTPS generation behind Render's reverse proxy
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.secret_key = "ai_agent_secret_key_change_this"
 CORS(app)
 
