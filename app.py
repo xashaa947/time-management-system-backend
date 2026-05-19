@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify, url_for, session, redirect
 from flask_cors import CORS
-from werkzeug.middleware.proxy_fix import ProxyFix
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
@@ -20,8 +19,6 @@ os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
 app = Flask(__name__)
-# Fix HTTPS generation behind Render's reverse proxy
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.secret_key = "ai_agent_secret_key_change_this"
 CORS(app)
 
@@ -353,9 +350,15 @@ def get_oauth_flow(scopes, redirect_uri=None):
         flow.redirect_uri = redirect_uri
     return flow
 
+def get_redirect_uri():
+    backend_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("BACKEND_URL")
+    if backend_url:
+        return f"{backend_url.rstrip('/')}/api/google/callback"
+    return url_for('google_callback', _external=True)
+
 @app.route('/api/google/login')
 def google_login():
-    flow = get_oauth_flow(SCOPES, redirect_uri=url_for('google_callback', _external=True))
+    flow = get_oauth_flow(SCOPES, redirect_uri=get_redirect_uri())
     print(f"DEBUG: [login] Redirect URI set to: {flow.redirect_uri}")
     
     authorization_url, state = flow.authorization_url(
@@ -401,7 +404,7 @@ def google_callback():
     code_verifier = row['code_verifier'] if row else None
     print(f"DEBUG: [callback] Retrieved code_verifier from DB: {code_verifier}")
     
-    flow = get_oauth_flow(SCOPES, redirect_uri=url_for('google_callback', _external=True))
+    flow = get_oauth_flow(SCOPES, redirect_uri=get_redirect_uri())
     
     if code_verifier:
         flow.code_verifier = code_verifier
