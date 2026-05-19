@@ -329,12 +329,30 @@ SCOPES = [
     'openid'
 ]
 
+def get_oauth_flow(scopes, redirect_uri=None):
+    """Create OAuth flow from credentials.json (local) or env vars (Render)."""
+    if os.path.exists(CLIENT_SECRETS_FILE):
+        flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE, scopes=scopes)
+    else:
+        client_config = {
+            "web": {
+                "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+                "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs"
+            }
+        }
+        flow = google_auth_oauthlib.flow.Flow.from_client_config(
+            client_config, scopes=scopes)
+    if redirect_uri:
+        flow.redirect_uri = redirect_uri
+    return flow
+
 @app.route('/api/google/login')
 def google_login():
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES)
-    # Match the redirect URI to the host being used
-    flow.redirect_uri = url_for('google_callback', _external=True)
+    flow = get_oauth_flow(SCOPES, redirect_uri=url_for('google_callback', _external=True))
     print(f"DEBUG: [login] Redirect URI set to: {flow.redirect_uri}")
     
     authorization_url, state = flow.authorization_url(
@@ -380,9 +398,7 @@ def google_callback():
     code_verifier = row['code_verifier'] if row else None
     print(f"DEBUG: [callback] Retrieved code_verifier from DB: {code_verifier}")
     
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES)
-    flow.redirect_uri = url_for('google_callback', _external=True)
+    flow = get_oauth_flow(SCOPES, redirect_uri=url_for('google_callback', _external=True))
     
     if code_verifier:
         flow.code_verifier = code_verifier
