@@ -482,7 +482,7 @@ def google_callback():
         }
         user_json = json.dumps(frontend_user)
         encoded_user = urllib.parse.quote(user_json)
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        frontend_url = os.getenv("FRONTEND_URL", "https://time-management-system-five.vercel.app")
         return redirect(f"{frontend_url}/?auth_data={encoded_user}")
     else:
         return jsonify({"error": "Google login failed, no email found"})
