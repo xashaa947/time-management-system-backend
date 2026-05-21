@@ -116,7 +116,7 @@ def init_db():
 
 init_db()
 
-def is_time_conflict(user_id, date, start_time, end_time):
+def is_time_conflict(user_id, date, start_time, end_time, exclude_group_id=None):
     if not user_id or not date or not start_time:
         return False
         
@@ -132,10 +132,17 @@ def is_time_conflict(user_id, date, start_time, end_time):
     p = "%s" if is_pg else "?"
     c = conn.cursor()
 
-    c.execute(f'''
+    sql = f'''
         SELECT time, end_time FROM tasks
         WHERE user_id = {p} AND date = {p} AND status = 'approved'
-    ''', (user_id, date))
+    '''
+    params = [user_id, date]
+    
+    if exclude_group_id:
+        sql += f" AND (group_id IS NULL OR group_id != {p})"
+        params.append(exclude_group_id)
+
+    c.execute(sql, tuple(params))
 
     rows = c.fetchall()
     conn.close()
@@ -174,7 +181,7 @@ def save_task_to_db(task, user_id=None, created_by=None):
     
     # Skip conflict check for pending tasks (they are just requests)
     if task.get('status', 'approved') == 'approved':
-        if is_time_conflict(user_id, task.get('date'), task.get('time'), task.get('end_time')):
+        if is_time_conflict(user_id, task.get('date'), task.get('time'), task.get('end_time'), exclude_group_id=task.get('group_id')):
             print(f"⚠️ Давхцал илэрлээ! User: {user_id}, Date: {task.get('date')}, Time: {task.get('time')}")
             return None
 
@@ -1030,8 +1037,8 @@ def update_task_status(task_id):
             delete_google_calendar_event(owner_id, task['google_event_id'])
             c.execute(f'DELETE FROM tasks WHERE id = {p}', (task_id,))
     elif new_status == 'approved':
-        # Check conflicts
-        if is_time_conflict(task['user_id'], task['date'], task['time'], task['end_time']):
+        # Check conflicts - Exclude current group_id to allow accepting shared tasks
+        if is_time_conflict(task['user_id'], task['date'], task['time'], task['end_time'], exclude_group_id=task.get('group_id')):
             conn.close()
             return jsonify({"success": False, "error": "Давхцал илэрлээ. Хэрэглэгч завгүй."}), 409
         
