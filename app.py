@@ -6,12 +6,18 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 import sqlite3
+try:
+    import psycopg2
+    from psycopg2.extras import DictCursor
+except ImportError:
+    psycopg2 = None
 import json
 from datetime import datetime, timedelta
 import google.oauth2.credentials
 import google_auth_oauthlib.flow
 from googleapiclient.discovery import build
 import requests
+import uuid
 
 # Allow insecure transport for local development (OAUTH2 over HTTP)
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
@@ -25,20 +31,40 @@ CORS(app)
 # Database Setup
 DB_NAME = "schedule.db"
 
+def get_db_connection():
+    db_url = os.getenv("DATABASE_URL")
+    if db_url and db_url.startswith("postgresql") and psycopg2:
+        # PostgreSQL (Supabase)
+        conn = psycopg2.connect(db_url, cursor_factory=DictCursor)
+        return conn, True
+    else:
+        # Local SQLite
+        conn = sqlite3.connect(DB_NAME, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn, False
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    c = conn.cursor()   
-    c.execute('''
+    conn, is_pg = get_db_connection()
+    c = conn.cursor()
+    
+    # Auto-increment differences
+    id_type = "SERIAL PRIMARY KEY" if is_pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    
+    c.execute(f'''
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {id_type},
             username TEXT UNIQUE,
             password TEXT,
-            role TEXT
+            role TEXT,
+            google_token TEXT,
+            code_verifier TEXT,
+            email TEXT
         )
     ''')
-    c.execute('''
+    
+    c.execute(f'''
         CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {id_type},
             user_id INTEGER,
             type TEXT,
             content TEXT,
@@ -49,49 +75,37 @@ def init_db():
             title TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             created_by INTEGER,
+            google_event_id TEXT,
+            group_id TEXT,
+            meet_link TEXT,
             FOREIGN KEY (user_id) REFERENCES users (id),
             FOREIGN KEY (created_by) REFERENCES users (id)
         )
     ''')
-    # Existing tables migration
-    try:
-        c.execute("ALTER TABLE tasks ADD COLUMN end_time TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE tasks ADD COLUMN status TEXT DEFAULT 'approved'")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN google_token TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN code_verifier TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE tasks ADD COLUMN google_event_id TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE tasks ADD COLUMN created_by INTEGER")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN email TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE tasks ADD COLUMN group_id TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE tasks ADD COLUMN meet_link TEXT")
-    except sqlite3.OperationalError:
-        pass
     
-    # Update all existing users to admin
+    # Existing tables migration (Postgres handles ALTER differently, but this is safe)
+    if not is_pg:
+        # SQLite migrations
+        try: c.execute("ALTER TABLE tasks ADD COLUMN end_time TEXT")
+        except: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN status TEXT DEFAULT 'approved'")
+        except: pass
+        try: c.execute("ALTER TABLE users ADD COLUMN google_token TEXT")
+        except: pass
+        try: c.execute("ALTER TABLE users ADD COLUMN code_verifier TEXT")
+        except: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN google_event_id TEXT")
+        except: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN created_by INTEGER")
+        except: pass
+        try: c.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        except: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN group_id TEXT")
+        except: pass
+        try: c.execute("ALTER TABLE tasks ADD COLUMN meet_link TEXT")
+        except: pass
+    
+    # Initial admin setup
     try:
         c.execute("UPDATE users SET role = 'admin'")
     except:
@@ -114,12 +128,13 @@ def is_time_conflict(user_id, date, start_time, end_time):
         except:
             end_time = start_time
 
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
 
-    c.execute('''
+    c.execute(f'''
         SELECT time, end_time FROM tasks
-        WHERE user_id = ? AND date = ? AND status = 'approved'
+        WHERE user_id = {p} AND date = {p} AND status = 'approved'
     ''', (user_id, date))
 
     rows = c.fetchall()
@@ -163,14 +178,25 @@ def save_task_to_db(task, user_id=None, created_by=None):
             print(f"⚠️ Давхцал илэрлээ! User: {user_id}, Date: {task.get('date')}, Time: {task.get('time')}")
             return None
 
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
-    c.execute('''
+    
+    sql = f'''
         INSERT INTO tasks (user_id, type, content, date, time, end_time, status, title, created_by, group_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, task.get('type'), task.get('content'), task.get('date'), task.get('time'), 
-          task.get('end_time'), task.get('status', 'approved'), task.get('title'), created_by, task.get('group_id')))
-    task_id = c.lastrowid
+        VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})
+    '''
+    
+    if is_pg:
+        sql += " RETURNING id"
+        c.execute(sql, (user_id, task.get('type'), task.get('content'), task.get('date'), task.get('time'), 
+                      task.get('end_time'), task.get('status', 'approved'), task.get('title'), created_by, task.get('group_id')))
+        task_id = c.fetchone()[0]
+    else:
+        c.execute(sql, (user_id, task.get('type'), task.get('content'), task.get('date'), task.get('time'), 
+                      task.get('end_time'), task.get('status', 'approved'), task.get('title'), created_by, task.get('group_id')))
+        task_id = c.lastrowid
+        
     conn.commit()
     conn.close()
     
@@ -187,11 +213,12 @@ def save_task_to_db(task, user_id=None, created_by=None):
 
 @app.route("/users", methods=["GET"])
 def get_users():
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn, is_pg = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT id, username, email FROM users")
-    users = [dict(row) for row in c.fetchall()]
+    # Postgres DictCursor behaves like dict, SQLite Row needs dict() conversion
+    rows = c.fetchall()
+    users = [dict(row) for row in rows]
     conn.close()
     return jsonify(users)
 
@@ -218,12 +245,12 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
     if not user_id or not date or not start_time:
         return []
 
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
-    c.execute("""
+    c.execute(f"""
         SELECT title, content, time, end_time FROM tasks
-        WHERE user_id = ? AND date = ? AND status = 'approved'
+        WHERE user_id = {p} AND date = {p} AND status = 'approved'
     """, (user_id, date))
     rows = c.fetchall()
     conn.close()
@@ -269,11 +296,11 @@ def admin_add_task():
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def get_all_tasks_as_string(user_id=None):
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
     if user_id:
-        c.execute('SELECT type, content, date, time, end_time, status, title FROM tasks WHERE user_id = ? ORDER BY date, time', (user_id,))
+        c.execute(f'SELECT type, content, date, time, end_time, status, title FROM tasks WHERE user_id = {p} ORDER BY date, time', (user_id,))
     else:
         c.execute('SELECT type, content, date, time, end_time, status, title FROM tasks ORDER BY date, time')
     rows = c.fetchall()
@@ -305,10 +332,13 @@ SYSTEM_PROMPT = """
       "end_time": "HH:mm (дуусах)",
       "title": "Гарчиг",
       "status": "pending | approved",
-      "for_users": ["username1", "username2"]
+      "for_users": ["username1", "username2"],
+      "is_online_meeting": false,
+      "location": ""
     }
   ],
-  "available": true
+  "available": true,
+  "need_location": false
 }
 
 **ДҮРЭМ:**
@@ -317,7 +347,11 @@ SYSTEM_PROMPT = """
 3. **ТӨЛӨВ (STATUS):** Хэрэв "for_users" дотор хүмүүс байвал "status" нь заавал "pending" байх ёстой. Зөвхөн хэрэглэгч өөртөө ажил нэмж байгаа тохиолдолд "approved" байна.
 4. **ХУВААРЬ:** Чи өөрөө хуваарь шалгах шаардлагагүй, зөвхөн хүсэлтийг JSON болгож хувиргахад анхаарна уу. 
 5. **ХАРИУ:** Хэрэв мэдээлэл асуусан бол (жишээ нь "Өнөөдөр юу хийх вэ?") "tasks" массив хоосон байна.
-6. **Зөвхөн JSON.**
+6. **УУЛЗАЛТЫН ТӨРӨЛ:**
+   - "цахим уулзалт", "онлайн уулзалт", "видео уулзалт", "zoom", "meet", "online meeting" гэх мэт үгс байвал → "is_online_meeting": true, "location": "" гэж тохируул.
+   - "уулзалт" гэх мэт биечлэн уулзах утгатай үгс байвал → "is_online_meeting": false. Хэрэв байршил (хаана уулзах?) хэлэгдээгүй бол "need_location": true гэж тохируул.
+   - Ердийн ажлын даалгавар бол "is_online_meeting": false, "need_location": false.
+7. **Зөвхөн JSON.**
 """
 
 # GOOGLE OAUTH CONFIG
@@ -367,23 +401,18 @@ def google_login():
         prompt='consent')
     
     # Store state and code verifier temporarily
-    print(f"DEBUG: [login] Generated State: {state}")
-    print(f"DEBUG: [login] Generated Code Verifier: {flow.code_verifier}")
-    
     try:
-        conn = sqlite3.connect(DB_NAME, timeout=30)
+        conn, is_pg = get_db_connection()
+        p = "%s" if is_pg else "?"
         c = conn.cursor()
-        c.execute("CREATE TABLE IF NOT EXISTS oauth_sessions (state TEXT PRIMARY KEY, code_verifier TEXT)")
-        c.execute("INSERT OR REPLACE INTO oauth_sessions (state, code_verifier) VALUES (?, ?)", (state, flow.code_verifier))
-        conn.commit()
-        
-        # Verify it was saved
-        c.execute("SELECT code_verifier FROM oauth_sessions WHERE state = ?", (state,))
-        check_row = c.fetchone()
-        if check_row:
-            print(f"DEBUG: [login] Successfully saved state to DB. Verifier in DB: {check_row[0]}")
+        if is_pg:
+            c.execute("CREATE TABLE IF NOT EXISTS oauth_sessions (state TEXT PRIMARY KEY, code_verifier TEXT)")
+            # INSERT OR REPLACE is SQLite specific. PG uses INSERT ... ON CONFLICT
+            c.execute("INSERT INTO oauth_sessions (state, code_verifier) VALUES (%s, %s) ON CONFLICT (state) DO UPDATE SET code_verifier = EXCLUDED.code_verifier", (state, flow.code_verifier))
         else:
-            print("DEBUG: [login] ERROR: Failed to save state to DB!")
+            c.execute("CREATE TABLE IF NOT EXISTS oauth_sessions (state TEXT PRIMARY KEY, code_verifier TEXT)")
+            c.execute("INSERT OR REPLACE INTO oauth_sessions (state, code_verifier) VALUES (?, ?)", (state, flow.code_verifier))
+        conn.commit()
         conn.close()
     except Exception as e:
         print(f"DEBUG: [login] DB Error: {e}")
@@ -393,15 +422,14 @@ def google_login():
 @app.route('/api/google/callback')
 def google_callback():
     state = request.args.get('state')
-    print(f"DEBUG: [callback] Received state: {state}")
     
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
-    c.execute("SELECT code_verifier FROM oauth_sessions WHERE state = ?", (state,))
+    c.execute(f"SELECT code_verifier FROM oauth_sessions WHERE state = {p}", (state,))
     row = c.fetchone()
     
-    code_verifier = row['code_verifier'] if row else None
+    code_verifier = row[0] if row else None
     print(f"DEBUG: [callback] Retrieved code_verifier from DB: {code_verifier}")
     
     flow = get_oauth_flow(SCOPES, redirect_uri=get_redirect_uri())
@@ -421,16 +449,11 @@ def google_callback():
     print(f"DEBUG: [callback] Fetching token with response URL: {authorization_response}")
     
     if not code_verifier:
-         print("DEBUG: [callback] CRITICAL: Missing code_verifier. State lookup failed.")
          return jsonify({"error": "OAuth state mismatch or expired. Please go back to the login page and try again."}), 400
     try:
-        # Explicitly pass code_verifier just in case setdefault fails for some reason
         flow.fetch_token(authorization_response=authorization_response, code_verifier=code_verifier)
-        print("DEBUG: [callback] Token fetch successful")
-        
-        # Delete state ONLY after successful token fetch
         if state:
-            c.execute("DELETE FROM oauth_sessions WHERE state = ?", (state,))
+            c.execute(f"DELETE FROM oauth_sessions WHERE state = {p}", (state,))
             conn.commit()
     except Exception as e:
         print(f"DEBUG: [callback] Token fetch failed: {e}")
@@ -452,23 +475,30 @@ def google_callback():
         user_name = "Unknown User"
 
     if user_email:
-        c.execute("SELECT * FROM users WHERE email = ?", (user_email,))
+        c.execute(f"SELECT * FROM users WHERE email = {p}", (user_email,))
         user = c.fetchone()
         if user:
-            user_id = user['id']
-            c.execute("UPDATE users SET google_token = ?, username = ? WHERE id = ?", (creds_json, user_name, user_id))
+            # handle dict access
+            uid = user['id'] if hasattr(user, '__getitem__') else user[0]
+            c.execute(f"UPDATE users SET google_token = {p}, username = {p} WHERE id = {p}", (creds_json, user_name, uid))
             conn.commit()
+            user_id = uid
         else:
-            c.execute("SELECT id FROM users WHERE username = ?", (user_name,))
+            c.execute(f"SELECT id FROM users WHERE username = {p}", (user_name,))
             if c.fetchone():
                 import random
                 user_name = f"{user_name}_{random.randint(100,999)}"
-            c.execute("INSERT INTO users (username, password, role, email, google_token) VALUES (?, ?, ?, ?, ?)",
-                      (user_name, '', 'admin', user_email, creds_json))
-            user_id = c.lastrowid
+            
+            sql_ins = f"INSERT INTO users (username, password, role, email, google_token) VALUES ({p}, {p}, {p}, {p}, {p})"
+            if is_pg:
+                c.execute(sql_ins + " RETURNING id", (user_name, '', 'admin', user_email, creds_json))
+                user_id = c.fetchone()[0]
+            else:
+                c.execute(sql_ins, (user_name, '', 'admin', user_email, creds_json))
+                user_id = c.lastrowid
             conn.commit()
             
-        c.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        c.execute(f"SELECT * FROM users WHERE id = {p}", (user_id,))
         updated_user = dict(c.fetchone())
     conn.close()
     
@@ -488,14 +518,15 @@ def google_callback():
         return jsonify({"error": "Google login failed, no email found"})
 
 def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True):
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
-    c.execute("SELECT google_token FROM users WHERE id = ?", (user_id,))
+    c.execute(f"SELECT google_token FROM users WHERE id = {p}", (user_id,))
     row = c.fetchone()
-    conn.close()
+    # Close for now, will reopen if refresh needed or at end
     
     if not row or not row['google_token']:
+        conn.close()
         print(f"No google_token for user {user_id}")
         return None
         
@@ -506,11 +537,8 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
         if credentials.expired and credentials.refresh_token:
             from google.auth.transport.requests import Request
             credentials.refresh(Request())
-            conn = sqlite3.connect(DB_NAME, timeout=30)
-            c = conn.cursor()
-            c.execute("UPDATE users SET google_token = ? WHERE id = ?", (credentials.to_json(), user_id))
+            c.execute(f"UPDATE users SET google_token = {p} WHERE id = {p}", (credentials.to_json(), user_id))
             conn.commit()
-            conn.close()
             
         service = build('calendar', 'v3', credentials=credentials)
         
@@ -539,10 +567,15 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
           },
         }
         
-        # Check if this is a meeting to add Google Meet link & Reminders
+        # Check if this is an online meeting → add Google Meet link
+        # Check if it's an in-person meeting → add location to calendar event
+        is_online = task.get('is_online_meeting', False)
+        location = task.get('location', '')
         title_lower = task.get('title', '').lower()
         type_lower = task.get('type', '').lower()
-        if 'уулзалт' in title_lower or 'uulzalt' in title_lower or 'уулзалт' in type_lower or 'uulzalt' in type_lower:
+        is_any_meeting = is_online or 'уулзалт' in title_lower or 'уулзалт' in type_lower
+
+        if is_online or (is_any_meeting and generate_meet):
             if generate_meet:
                 import time
                 event['conferenceData'] = {
@@ -557,7 +590,12 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
                     desc = event.get('description', '')
                     event['description'] = f"{desc}\n\nGoogle Meet: {meet_link}" if desc else f"Google Meet: {meet_link}"
                     event['location'] = meet_link
+        elif is_any_meeting and location:
+            # In-person meeting with known location
+            event['location'] = location
 
+        # Add attendees & reminders for ALL meeting types
+        if is_any_meeting:
             attendees = []
             target_usernames = task.get('for_users', [])
             
@@ -565,7 +603,6 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
             conn_users.row_factory = sqlite3.Row
             c_users = conn_users.cursor()
             
-            #huselt avsan hun
             if target_usernames:
                 for tu in target_usernames:
                     clean_name = tu.replace("@", "").strip()
@@ -609,18 +646,21 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
         
         # Store the event ID in the database for this specific task
         if task_id:
-            conn = sqlite3.connect(DB_NAME, timeout=30)
-            conn.row_factory = sqlite3.Row
+            # Reopen connection for update
+            conn, is_pg = get_db_connection()
+            p = "%s" if is_pg else "?"
             c = conn.cursor()
             
             if generate_meet and meet_link:
-                c.execute("UPDATE tasks SET google_event_id = ?, meet_link = ? WHERE id = ?", (event_id, meet_link, task_id))
-                c.execute("SELECT group_id FROM tasks WHERE id = ?", (task_id,))
-                grp = c.fetchone()
-                if grp and grp['group_id']:
-                    c.execute("UPDATE tasks SET meet_link = ? WHERE group_id = ?", (meet_link, grp['group_id']))
+                c.execute(f"UPDATE tasks SET google_event_id = {p}, meet_link = {p} WHERE id = {p}", (event_id, meet_link, task_id))
+                c.execute(f"SELECT group_id FROM tasks WHERE id = {p}", (task_id,))
+                grp_row = c.fetchone()
+                # Handle DictCursor vs Row
+                grp = grp_row[0] if grp_row and not hasattr(grp_row, '__getitem__') else (grp_row['group_id'] if grp_row else None)
+                if grp:
+                    c.execute(f"UPDATE tasks SET meet_link = {p} WHERE group_id = {p}", (meet_link, grp))
             else:
-                c.execute("UPDATE tasks SET google_event_id = ? WHERE id = ?", (event_id, task_id))
+                c.execute(f"UPDATE tasks SET google_event_id = {p} WHERE id = {p}", (event_id, task_id))
                 
             conn.commit()
             conn.close()
@@ -630,15 +670,12 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
         error_str = str(e)
         if "invalid_grant" in error_str or "expired" in error_str:
             # Clear invalid/revoked token so user knows they need to re-login
-            try:
-                conn = sqlite3.connect(DB_NAME, timeout=30)
-                c = conn.cursor()
-                c.execute("UPDATE users SET google_token = NULL WHERE id = ?", (user_id,))
-                conn.commit()
-                conn.close()
-                print(f"DEBUG: Token for user {user_id} was revoked/expired and has been cleared from DB.")
-            except:
-                pass
+            conn, is_pg = get_db_connection()
+            p = "%s" if is_pg else "?"
+            c = conn.cursor()
+            c.execute(f"UPDATE users SET google_token = NULL WHERE id = {p}", (user_id,))
+            conn.commit()
+            conn.close()
         print(f"Google Calendar Sync Error for user {user_id}: {e}")
         return None
 
@@ -646,14 +683,14 @@ def delete_google_calendar_event(user_id, google_event_id):
     if not google_event_id:
         return
         
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
-    c.execute("SELECT google_token FROM users WHERE id = ?", (user_id,))
+    c.execute(f"SELECT google_token FROM users WHERE id = {p}", (user_id,))
     row = c.fetchone()
-    conn.close()
     
     if not row or not row['google_token']:
+        conn.close()
         return
         
     try:
@@ -663,14 +700,12 @@ def delete_google_calendar_event(user_id, google_event_id):
         if credentials.expired and credentials.refresh_token:
             from google.auth.transport.requests import Request
             credentials.refresh(Request())
-            conn = sqlite3.connect(DB_NAME, timeout=30)
-            c = conn.cursor()
-            c.execute("UPDATE users SET google_token = ? WHERE id = ?", (credentials.to_json(), user_id))
+            c.execute(f"UPDATE users SET google_token = {p} WHERE id = {p}", (credentials.to_json(), user_id))
             conn.commit()
-            conn.close()
             
         service = build('calendar', 'v3', credentials=credentials)
         service.events().delete(calendarId='primary', eventId=google_event_id).execute()
+        conn.close()
     except Exception as e:
         print(f"Google Calendar Deletion Error: {e}")
 
@@ -681,6 +716,57 @@ def agent():
     user_date = data.get("date", "")
     user_time = data.get("time", "")
     user_id = data.get("user_id")
+
+    # ── PENDING TASK MODE (байршил хүлээж авах) ──────────────────────────────
+    if data.get("pending_task_mode") and data.get("pending_task"):
+        pending = data["pending_task"]
+        location = user_text.strip()   # хэрэглэгч байршлыг мессежээр явуулна
+        pending["location"] = location
+        pending["is_online_meeting"] = False
+        # Байршлыг content-д нэмэх — хүсэлт авсан хүн хаана болохыг харна
+        existing_content = pending.get("content", "") or pending.get("title", "")
+        pending["content"] = f"{existing_content} ({location})".strip()
+
+        conn, is_pg = get_db_connection()
+        p = "%s" if is_pg else "?"
+        c = conn.cursor()
+
+        # for_users-аас target user_id-уудыг олох
+        target_usernames = pending.get("for_users", [])
+        if not target_usernames:
+            c.execute(f"SELECT username FROM users WHERE id = {p}", (user_id,))
+            u_row = c.fetchone()
+            if u_row:
+                uname = u_row['username'] if hasattr(u_row, '__getitem__') else u_row[0]
+                target_usernames = [uname]
+
+        target_user_ids = []
+        for tu in target_usernames:
+            clean = tu.replace("@", "").strip()
+            c.execute(f"SELECT id FROM users WHERE LOWER(username) = LOWER({p})", (clean,))
+            row = c.fetchone()
+            if row:
+                uid = row['id'] if hasattr(row, '__getitem__') else row[0]
+                target_user_ids.append(uid)
+
+        if user_id not in target_user_ids:
+            target_user_ids.append(user_id)
+
+        import uuid
+        group_id = str(uuid.uuid4())
+        saved_any = False
+        for uid in target_user_ids:
+            task_to_save = pending.copy()
+            task_to_save["group_id"] = group_id
+            task_to_save["status"] = "approved" if uid == user_id else "pending"
+            task_id = save_task_to_db(task_to_save, uid, user_id)
+            if task_id:
+                saved_any = True
+
+        conn.close()
+        summary = f"✅ '{pending.get('title', 'Уулзалт')}' — {location}-д амжилттай товлогдлоо." if saved_any else "Давхцал байгаа тул хадгалагдсангүй."
+        return jsonify({"summary": summary, "tasks": [pending], "available": saved_any})
+    # ─────────────────────────────────────────────────────────────────────────
 
     if not user_text and not user_date and not user_time:
         return jsonify({"error": "Хүсэлт хоосон байна"}), 400
@@ -693,8 +779,8 @@ def agent():
     if user_time: hints += f"\nХэрэглэгчийн сонгосон цаг: {user_time}"
 
     # Database connection for initial mention and conflict checks
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
 
     # 1. Mention detection
@@ -724,12 +810,13 @@ def agent():
             })
 
     # Get current user role and all usernames for AI context
-    c.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+    c.execute(f"SELECT role FROM users WHERE id = {p}", (user_id,))
     user_row = c.fetchone()
-    user_role = user_row['role'] if user_row else 'user'
+    user_role = (user_row['role'] if user_row else 'user') if is_pg else (user_row[0] if user_row else 'user')
 
     c.execute("SELECT username FROM users")
-    all_usernames = [f"@{r['username']}" for r in c.fetchall()]
+    rows = c.fetchall()
+    all_usernames = [f"@{r['username'] if is_pg else r[1]}" for r in rows]
     usernames_context = f"\nБоломжит хэрэглэгчид: {', '.join(all_usernames)}"
 
     schedule_context = ""
@@ -752,7 +839,18 @@ def agent():
         result_text = completion.choices[0].message.content
         result_json = json.loads(result_text)
 
-        # 3. Backend Conflict Checking Logic
+        # 3. Check if location is needed for in-person meeting
+        if result_json.get("need_location") and result_json.get("tasks"):
+            # Return a question asking for the location instead of saving
+            return jsonify({
+                "summary": "Уулзалт хийх байршлыг хэлнэ үү? (жишээ нь: оффис, кофе шоп, гэх мэт)",
+                "tasks": [],
+                "available": True,
+                "need_location": True,
+                "pending_task": result_json["tasks"][0] if result_json["tasks"] else None
+            })
+
+        # 4. Backend Conflict Checking Logic
         if "tasks" in result_json and result_json["tasks"]:
             all_conflicts = []
             enriched_tasks = []
@@ -761,16 +859,20 @@ def agent():
                 target_usernames = task.get("for_users", [])
                 if not target_usernames:
                     # Default to current user
-                    c.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+                    c.execute(f"SELECT username FROM users WHERE id = {p}", (user_id,))
                     u_row = c.fetchone()
-                    if u_row: target_usernames = [u_row['username']]
+                    if u_row:
+                        uname = u_row['username'] if is_pg else u_row[0]
+                        target_usernames = [uname]
                 
                 target_user_ids = []
                 for tu in target_usernames:
                     clean_name = tu.replace("@", "").strip()
-                    c.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (clean_name,))
+                    c.execute(f"SELECT id FROM users WHERE LOWER(username) = LOWER({p})", (clean_name,))
                     u_row = c.fetchone()
-                    if u_row: target_user_ids.append((u_row['id'], clean_name))
+                    if u_row:
+                        uid = u_row['id'] if is_pg else u_row[0]
+                        target_user_ids.append((uid, clean_name))
 
                 # Check conflicts for each target user
                 for tid, tname in target_user_ids:
@@ -827,17 +929,17 @@ def agent():
 @app.route("/tasks", methods=["GET"])
 def get_tasks():
     user_id = request.args.get("user_id")
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
     
     if user_id:
-        c.execute('''
+        c.execute(f'''
             SELECT tasks.*, u1.username as created_by_username, u2.username as target_username
             FROM tasks 
             LEFT JOIN users u1 ON tasks.created_by = u1.id 
             LEFT JOIN users u2 ON tasks.user_id = u2.id
-            WHERE tasks.user_id = ? OR tasks.created_by = ?
+            WHERE tasks.user_id = {p} OR tasks.created_by = {p}
             ORDER BY tasks.created_at DESC
         ''', (user_id, user_id))
     else:
@@ -858,37 +960,36 @@ def get_tasks():
 
 @app.route("/tasks/<int:task_id>", methods=["DELETE"])
 def delete_task(task_id):
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
-    c.execute('SELECT group_id FROM tasks WHERE id = ?', (task_id,))
-    task = c.fetchone()
+    c.execute(f'SELECT group_id FROM tasks WHERE id = {p}', (task_id,))
+    row = c.fetchone()
     
-    if not task:
+    if not row:
         conn.close()
         return jsonify({"success": False, "error": "Task not found"})
         
-    try:
-        group_id = task['group_id']
-    except IndexError:
-        group_id = None
+    group_id = row['group_id'] if is_pg else row[0]
         
     if group_id:
-        c.execute('SELECT user_id, status, created_by, google_event_id FROM tasks WHERE group_id = ?', (group_id,))
-        tasks_to_delete = c.fetchall()
+        c.execute(f'SELECT user_id, status, created_by, google_event_id FROM tasks WHERE group_id = {p}', (group_id,))
+        rows = c.fetchall()
         
-        for t in tasks_to_delete:
+        for r in rows:
+            t = dict(r)
             owner_id = t['created_by'] if t['status'] == 'pending' and t['created_by'] else t['user_id']
             delete_google_calendar_event(owner_id, t['google_event_id'])
             
-        c.execute('DELETE FROM tasks WHERE group_id = ?', (group_id,))
+        c.execute(f'DELETE FROM tasks WHERE group_id = {p}', (group_id,))
     else:
-        c.execute('SELECT user_id, status, created_by, google_event_id FROM tasks WHERE id = ?', (task_id,))
-        t = c.fetchone()
-        if t:
+        c.execute(f'SELECT user_id, status, created_by, google_event_id FROM tasks WHERE id = {p}', (task_id,))
+        r = c.fetchone()
+        if r:
+            t = dict(r)
             owner_id = t['created_by'] if t['status'] == 'pending' and t['created_by'] else t['user_id']
             delete_google_calendar_event(owner_id, t['google_event_id'])
-            c.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
+            c.execute(f'DELETE FROM tasks WHERE id = {p}', (task_id,))
             
     conn.commit()
     conn.close()
@@ -899,36 +1000,35 @@ def update_task_status(task_id):
     data = request.get_json()
     new_status = data.get("status")
     
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    conn.row_factory = sqlite3.Row
+    conn, is_pg = get_db_connection()
+    p = "%s" if is_pg else "?"
     c = conn.cursor()
     
     # 1. Fetch task
-    c.execute('SELECT * FROM tasks WHERE id = ?', (task_id,))
-    task = c.fetchone()
+    c.execute(f'SELECT * FROM tasks WHERE id = {p}', (task_id,))
+    row = c.fetchone()
     
-    if not task:
+    if not row:
         conn.close()
         return jsonify({"success": False, "error": "Task not found"}), 404
+        
+    task = dict(row)
     
     # 2. Approve or Reject logic
     if new_status == 'rejected':
-        try:
-            group_id = task['group_id']
-        except IndexError:
-            group_id = None
-            
+        group_id = task.get('group_id')
         if group_id:
-            c.execute('SELECT user_id, status, created_by, google_event_id FROM tasks WHERE group_id = ?', (group_id,))
+            c.execute(f'SELECT user_id, status, created_by, google_event_id FROM tasks WHERE group_id = {p}', (group_id,))
             tasks_to_delete = c.fetchall()
-            for t in tasks_to_delete:
+            for r in tasks_to_delete:
+                t = dict(r)
                 owner_id = t['created_by'] if t['status'] == 'pending' and t['created_by'] else t['user_id']
                 delete_google_calendar_event(owner_id, t['google_event_id'])
-            c.execute('DELETE FROM tasks WHERE group_id = ?', (group_id,))
+            c.execute(f'DELETE FROM tasks WHERE group_id = {p}', (group_id,))
         else:
             owner_id = task['created_by'] if task['status'] == 'pending' and task['created_by'] else task['user_id']
             delete_google_calendar_event(owner_id, task['google_event_id'])
-            c.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
+            c.execute(f'DELETE FROM tasks WHERE id = {p}', (task_id,))
     elif new_status == 'approved':
         # Check conflicts
         if is_time_conflict(task['user_id'], task['date'], task['time'], task['end_time']):
@@ -936,25 +1036,24 @@ def update_task_status(task_id):
             return jsonify({"success": False, "error": "Давхцал илэрлээ. Хэрэглэгч завгүй."}), 409
         
         # Update status
-        c.execute('UPDATE tasks SET status = ? WHERE id = ?', (new_status, task_id))
+        c.execute(f'UPDATE tasks SET status = {p} WHERE id = {p}', (new_status, task_id))
         conn.commit()
         
         # Google Calendar sync for receiver (doesn't generate duplicate meet link)
         try:
             task_copy = dict(task)
-            task_copy['created_by'] = task['created_by']
-            # Fetch the updated meet_link directly in case it wasn't pre-populated in the `task` variable initially
-            c.execute('SELECT meet_link FROM tasks WHERE id = ?', (task_id,))
+            # Fetch the updated meet_link directly
+            c.execute(f'SELECT meet_link FROM tasks WHERE id = {p}', (task_id,))
             updated_task = c.fetchone()
-            if updated_task and updated_task['meet_link']:
-                task_copy['meet_link'] = updated_task['meet_link']
+            if updated_task:
+                task_copy['meet_link'] = updated_task['meet_link'] if is_pg else updated_task[0]
             
             create_google_calendar_event(task_copy, task['user_id'], task_id, generate_meet=False)
         except Exception as e:
             print(f"Calendar sync failed: {e}")
     else:
         # For any other custom status
-        c.execute('UPDATE tasks SET status = ? WHERE id = ?', (new_status, task_id))
+        c.execute(f'UPDATE tasks SET status = {p} WHERE id = {p}', (new_status, task_id))
     
     conn.commit()
     conn.close()
@@ -962,4 +1061,9 @@ def update_task_status(task_id):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    # Run DB init with updated PostgreSQL support
+    try:
+        init_db()
+    except Exception as e:
+        print(f"DB Init Error: {e}")
     app.run(host="0.0.0.0", port=port, debug=False)
