@@ -229,6 +229,59 @@ def get_users():
     conn.close()
     return jsonify(users)
 
+def parse_time_from_text(text):
+    """
+    Хэрэглэгчийн текстээс цагийг regex-ээр задлан, 24 цагийн HH:MM форматаар буцаана.
+    Зөвхөн 'орой', 'pm', 'үдээс хойш' гэж тодорхой хэлсэн бол PM болгоно,
+    эс бол тоог шууд цаг болгоно (5 → 05:00, 13 → 13:00).
+    Буцаах утга: (start_time, end_time) эсвэл (None, None)
+    """
+    import re
+    text_lower = text.lower()
+
+    # PM context keywords
+    is_pm = any(w in text_lower for w in ['орой', 'pm', 'p.m', 'үдээс хойш', 'afternoon', 'evening'])
+    is_am = any(w in text_lower for w in ['өглөө', 'am', 'a.m', 'үүрийн', 'шөнийн'])
+
+    def to_24h(hour, minute=0):
+        h = int(hour)
+        m = int(minute)
+        if is_pm and h < 12:
+            h += 12
+        elif is_am:
+            pass  # keep as-is
+        # else: treat literally (5→05, 13→13)
+        return f"{h:02d}:{m:02d}"
+
+    # Pattern: H:MM-H:MM or H-H:MM or H-H
+    range_pattern = re.search(
+        r'(\d{1,2})(?::(\d{2}))?\s*[-–]\s*(\d{1,2})(?::(\d{2}))?',
+        text
+    )
+    if range_pattern:
+        sh, sm, eh, em = range_pattern.groups()
+        start = to_24h(sh, sm or 0)
+        end = to_24h(eh, em or 0)
+        return start, end
+
+    # Pattern: single time like "5 цагт" or "14:30 цагт"
+    single_pattern = re.search(
+        r'(\d{1,2})(?::(\d{2}))?\s*(?:цагт|цаг|:00)?',
+        text
+    )
+    if single_pattern:
+        sh, sm = single_pattern.groups()
+        start = to_24h(sh, sm or 0)
+        # Default 1 hour duration
+        h = int(sh)
+        if is_pm and h < 12:
+            h += 12
+        end_h = (h + 1) % 24
+        end = f"{end_h:02d}:{int(sm or 0):02d}"
+        return start, end
+
+    return None, None
+
 def get_mentioned_user_ids(user_text, db_cursor):
     """
     Хэрэглэгчийн текстээс @username-г олж, тухайн хэрэглэгчийн ID-г буцаана.
@@ -857,7 +910,17 @@ def agent():
         result_text = completion.choices[0].message.content
         result_json = json.loads(result_text)
 
-        # 3. Check if location is needed for in-person meeting
+        # 3a. Override task times with backend regex parsing (more reliable than GPT)
+        if result_json.get("tasks"):
+            backend_start, backend_end = parse_time_from_text(user_text)
+            if backend_start:
+                for task in result_json["tasks"]:
+                    task["time"] = backend_start
+                    if backend_end and backend_end != backend_start:
+                        task["end_time"] = backend_end
+                    print(f"DEBUG: Backend time override → {backend_start} - {backend_end}")
+
+        # 3b. Check if location is needed for in-person meeting
         if result_json.get("need_location") and result_json.get("tasks"):
             # Return a question asking for the location instead of saving
             return jsonify({
