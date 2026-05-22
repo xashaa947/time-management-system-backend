@@ -157,19 +157,25 @@ def is_time_conflict(user_id, date, start_time, end_time, exclude_group_id=None)
              new_end += timedelta(days=1)
 
         for row in rows:
-            if not row[0]: continue
-            existing_start = datetime.strptime(row[0], "%H:%M")
+            try:
+                existing_time = row['time']
+                existing_end_time = row['end_time']
+            except:
+                existing_time = row[0]
+                existing_end_time = row[1]
+
+            if not existing_time: continue
+            existing_start = datetime.strptime(existing_time, "%H:%M")
             
-            if row[1]:
-                existing_end = datetime.strptime(row[1], "%H:%M")
+            if existing_end_time:
+                existing_end = datetime.strptime(existing_end_time, "%H:%M")
                 if existing_end <= existing_start:
                     existing_end += timedelta(days=1)
             else:
-                # Default existing task to 1 hour if no end_time
                 existing_end = existing_start + timedelta(hours=1)
 
             if (new_start < existing_end) and (new_end > existing_start):
-                return True  # Давхцал байна
+                return True
     except Exception as e:
         print(f"Conflict check error: {e}")
         return False
@@ -229,19 +235,67 @@ def get_users():
     conn.close()
     return jsonify(users)
 
+def normalize_username(name):
+    if not name: return ""
+    return name.lower().replace("@", "").replace("-", "").replace("_", "").replace(" ", "")
+
+def parse_time_from_text(text):
+    """
+    Хэрэглэгчийн текстээс цагийг regex-ээр задлан, 24 цагийн HH:MM форматаар буцаана.
+    Зөвхөн 'орой', 'pm', 'үдээс хойш' гэж тодорхой хэлсэн бол PM болгоно,
+    эс бол тоог шууд цаг болгоно (5 → 05:00, 13 → 13:00).
+    Буцаах утга: (start_time, end_time) эсвэл (None, None)
+    """
+    import re
+    text_lower = text.lower()
+
+    # PM context keywords
+    is_pm = any(w in text_lower for w in ['орой', 'pm', 'p.m', 'үдээс хойш', 'afternoon', 'evening'])
+    is_am = any(w in text_lower for w in ['өглөө', 'am', 'a.m', 'үүрийн', 'шөнийн'])
+
+    def to_24h(hour, minute=0):
+        h = int(hour)
+        m = int(minute)
+        if is_pm and h < 12:
+            h += 12
+        elif is_am:
+            pass  # keep as-is
+        return f"{h:02d}:{m:02d}"
+
+    # Pattern: H:MM-H:MM or H-H:MM or H-H
+    range_pattern = re.search(r'(\d{1,2})(?::(\d{2}))?\s*[-–]\s*(\d{1,2})(?::(\d{2}))?', text)
+    if range_pattern:
+        sh, sm, eh, em = range_pattern.groups()
+        return to_24h(sh, sm or 0), to_24h(eh, em or 0)
+
+    # Pattern: single time like "5 цагт"
+    single_pattern = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(?:цагт|цаг|:00)?', text)
+    if single_pattern:
+        sh, sm = single_pattern.groups()
+        start = to_24h(sh, sm or 0)
+        h = int(sh)
+        if is_pm and h < 12: h += 12
+        end = f"{(h+1)%24:02d}:{int(sm or 0):02d}"
+        return start, end
+
+    return None, None
+
 def get_mentioned_user_ids(user_text, db_cursor):
     """
     Хэрэглэгчийн текстээс @username-г олж, тухайн хэрэглэгчийн ID-г буцаана.
-    Хоосон зайтай нэрсийг илрүүлэхийн тулд өгөгдлийн сангийн нэрстэй харьцуулна.
     """
     db_cursor.execute("SELECT id, username FROM users")
     all_users = db_cursor.fetchall()
     user_ids = {}
-    lower_text = user_text.lower()
+    normalized_text = normalize_username(user_text)
     
-    for uid, username in all_users:
-        mention_tag = f"@{username.lower()}"
-        if mention_tag in lower_text:
+    for row in all_users:
+        try:
+            uid = row['id']; username = row['username']
+        except:
+            uid = row[0]; username = row[1]
+            
+        if normalize_username(username) in normalized_text:
             user_ids[uid] = username
     return user_ids 
 
@@ -277,26 +331,39 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
 
         conflicts = []
         for row in rows:
-            if not row['time']: continue
-            existing_start = datetime.strptime(row['time'], "%H:%M")
-            if row['end_time']:
-                existing_end = datetime.strptime(row['end_time'], "%H:%M")
+            try:
+                existing_time = row['time']
+                existing_end_time = row['end_time']
+                existing_title = row['title']
+                existing_content = row['content']
+            except:
+                existing_time = row[2]
+                existing_end_time = row[3]
+                existing_title = row[0]
+                existing_content = row[1]
+
+            if not existing_time: continue
+            existing_start = datetime.strptime(existing_time, "%H:%M")
+            if existing_end_time:
+                existing_end = datetime.strptime(existing_end_time, "%H:%M")
                 if existing_end <= existing_start:
                     existing_end += timedelta(days=1)
             else:
                 existing_end = existing_start + timedelta(hours=1)
                 
             if (new_start < existing_end) and (new_end > existing_start):
-                conflicts.append({"title": row['title'], "content": row['content']})
+                conflicts.append({"title": existing_title, "content": existing_content})
         return conflicts
-    except:
+    except Exception as e:
+        print(f"DEBUG: get_conflicting_tasks error: {e}")
         return []
 @app.route("/admin/add-task", methods=["POST"])
 def admin_add_task():
     data = request.get_json()
     user_id = data.get("user_id")
-    # Simple direct add
-    save_task_to_db(data, user_id, user_id)
+    task_id = save_task_to_db(data, user_id, user_id)
+    if not task_id:
+        return jsonify({"success": False, "message": "Цаг давхцаж байна"}), 409
     return jsonify({"success": True, "message": "Task added successfully"})
 
 # OpenAI client
@@ -606,29 +673,29 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
             attendees = []
             target_usernames = task.get('for_users', [])
             
-            conn_users = sqlite3.connect(DB_NAME, timeout=30)
-            conn_users.row_factory = sqlite3.Row
-            c_users = conn_users.cursor()
+            conn_att, is_pg_att = get_db_connection()
+            p_att = "%s" if is_pg_att else "?"
+            c_att = conn_att.cursor()
             
             if target_usernames:
                 for tu in target_usernames:
                     clean_name = tu.replace("@", "").strip()
-                    c_users.execute("SELECT email FROM users WHERE LOWER(username) = LOWER(?)", (clean_name,))
-                    u_row = c_users.fetchone()
-                    if u_row and u_row['email']:
-                        attendees.append({'email': u_row['email']})
+                    c_att.execute(f"SELECT email FROM users WHERE LOWER(username) = LOWER({p_att})", (clean_name,))
+                    u_row = c_att.fetchone()
+                    if u_row:
+                        u_mail = u_row['email'] if hasattr(u_row, 'keys') else u_row[0]
+                        if u_mail: attendees.append({'email': u_mail})
             
-            # sender_email (хүсэлт явуулсан хүн)
             sender_id = task.get('created_by')
             if sender_id:
-                c_users.execute("SELECT email FROM users WHERE id = ?", (sender_id,))
-                sender_row = c_users.fetchone()
-                if sender_row and sender_row['email']:
-                    sender_email = sender_row['email']
-                    if not any(a['email'] == sender_email for a in attendees):
-                        attendees.append({'email': sender_email})
+                c_att.execute(f"SELECT email FROM users WHERE id = {p_att}", (sender_id,))
+                sender_row = c_att.fetchone()
+                if sender_row:
+                    s_mail = sender_row['email'] if hasattr(sender_row, 'keys') else sender_row[0]
+                    if s_mail and not any(a['email'] == s_mail for a in attendees):
+                        attendees.append({'email': s_mail})
                         
-            conn_users.close()
+            conn_att.close()
             
             if attendees:
                 event['attendees'] = attendees
@@ -846,7 +913,44 @@ def agent():
         result_text = completion.choices[0].message.content
         result_json = json.loads(result_text)
 
-        # 3. Check if location is needed for in-person meeting
+        # 3a. Override task times with backend regex parsing (more reliable than GPT)
+        if result_json.get("tasks"):
+            backend_start, backend_end = parse_time_from_text(user_text)
+            if backend_start:
+                for task in result_json["tasks"]:
+                    task["time"] = backend_start
+                    if backend_end and backend_end != backend_start:
+                        task["end_time"] = backend_end
+
+        # 3b. Run conflict check BEFORE location prompt
+        if result_json.get("tasks"):
+            all_conflicts = []
+            for task in result_json["tasks"]:
+                target_usernames = task.get("for_users", [])
+                if not target_usernames:
+                    c.execute(f"SELECT username FROM users WHERE id = {p}", (user_id,))
+                    u_row = c.fetchone()
+                    if u_row:
+                        uname = u_row['username'] if is_pg else u_row[0]
+                        target_usernames = [uname]
+
+                for tu in target_usernames:
+                    clean_name = tu.replace("@", "").strip()
+                    c.execute(f"SELECT id FROM users WHERE LOWER(username) = LOWER({p})", (clean_name,))
+                    u_row = c.fetchone()
+                    if u_row:
+                        uid = u_row['id'] if is_pg else u_row[0]
+                        conflicts = get_conflicting_tasks(uid, task.get('date'), task.get('time'), task.get('end_time'))
+                        if conflicts:
+                            conflict_msgs = [f"Уучлаарай, @{clean_name} тухайн цагт '{c['title']}' ажилтай байна." for c in conflicts]
+                            conn.close()
+                            return jsonify({
+                                "summary": " ".join(conflict_msgs),
+                                "tasks": [],
+                                "available": False
+                            })
+
+        # 3c. Check if location is needed (only if no conflicts)
         if result_json.get("need_location") and result_json.get("tasks"):
             # Return a question asking for the location instead of saving
             return jsonify({
@@ -857,15 +961,12 @@ def agent():
                 "pending_task": result_json["tasks"][0] if result_json["tasks"] else None
             })
 
-        # 4. Backend Conflict Checking Logic
+        # 4. Save Logic (Already cleared conflicts in 3b)
         if "tasks" in result_json and result_json["tasks"]:
-            all_conflicts = []
             enriched_tasks = []
-            
             for task in result_json["tasks"]:
                 target_usernames = task.get("for_users", [])
                 if not target_usernames:
-                    # Default to current user
                     c.execute(f"SELECT username FROM users WHERE id = {p}", (user_id,))
                     u_row = c.fetchone()
                     if u_row:
@@ -880,41 +981,27 @@ def agent():
                     if u_row:
                         uid = u_row['id'] if is_pg else u_row[0]
                         target_user_ids.append((uid, clean_name))
-
-                # Check conflicts for each target user
-                for tid, tname in target_user_ids:
-                    conflicts = get_conflicting_tasks(tid, task.get('date'), task.get('time'), task.get('end_time'))
-                    if conflicts:
-                        for conf in conflicts:
-                            all_conflicts.append(f"Уучлаарай, @{tname} тухайн цагт '{conf['title']}' ({conf['content']}) ажилтай байгаа тул завгүй байна.")
                 
-                if not all_conflicts:
-                    enriched_tasks.append((task, [uid for uid, uname in target_user_ids]))
+                enriched_tasks.append((task, [uid for uid, uname in target_user_ids]))
 
-            if all_conflicts:
-                result_json["available"] = False
-                result_json["summary"] = " ".join(all_conflicts)
-                result_json["tasks"] = []
-                return jsonify(result_json)
-            else:
-                # No conflicts, proceed to save
-                result_json["available"] = True
-                for task, uids in enriched_tasks:
-                    import uuid
-                    group_id = str(uuid.uuid4())
+            # proceed to save
+            result_json["available"] = True
+            for task, uids in enriched_tasks:
+                import uuid
+                group_id = str(uuid.uuid4())
+                
+                if user_id not in uids:
+                    uids.append(user_id)
                     
-                    if user_id not in uids:
-                        uids.append(user_id)
-                        
-                    # If multiple users, save for each
-                    for uid in uids:
-                        task_to_save = task.copy()
-                        task_to_save['group_id'] = group_id
-                        if uid == user_id:
-                            task_to_save['status'] = 'approved'
-                        else:
-                            # Бусад хүмүүст заавал pending байх ёстой
-                            task_to_save['status'] = 'pending'
+                # If multiple users, save for each
+                for uid in uids:
+                    task_to_save = task.copy()
+                    task_to_save['group_id'] = group_id
+                    if uid == user_id:
+                        task_to_save['status'] = 'approved'
+                    else:
+                        # Бусад хүмүүст заавал pending байх ёстой
+                        task_to_save['status'] = 'pending'
                         
                         # save_task_to_db natively creates the event if status=='approved' (which it is for the Sender)
                         task_id = save_task_to_db(task_to_save, uid, user_id)
