@@ -920,7 +920,35 @@ def agent():
                         task["end_time"] = backend_end
                     print(f"DEBUG: Backend time override → {backend_start} - {backend_end}")
 
-        # 3b. Check if location is needed for in-person meeting
+        # 3b. Run conflict check BEFORE location prompt
+        #     Давхцал шалгалтыг байршил асуухаас ӨМНӨ хийнэ
+        if result_json.get("tasks"):
+            for task in result_json["tasks"]:
+                target_usernames = task.get("for_users", [])
+                if not target_usernames:
+                    c.execute(f"SELECT username FROM users WHERE id = {p}", (user_id,))
+                    u_row = c.fetchone()
+                    if u_row:
+                        uname = u_row['username'] if is_pg else u_row[0]
+                        target_usernames = [uname]
+
+                for tu in target_usernames:
+                    clean_name = tu.replace("@", "").strip()
+                    c.execute(f"SELECT id FROM users WHERE LOWER(username) = LOWER({p})", (clean_name,))
+                    u_row = c.fetchone()
+                    if u_row:
+                        uid = u_row['id'] if is_pg else u_row[0]
+                        conflicts = get_conflicting_tasks(uid, task.get('date'), task.get('time'), task.get('end_time'))
+                        if conflicts:
+                            conflict_msgs = [f"Уучлаарай, @{clean_name} тухайн цагт '{c['title']}' ажилтай байна." for c in conflicts]
+                            conn.close()
+                            return jsonify({
+                                "summary": " ".join(conflict_msgs),
+                                "tasks": [],
+                                "available": False
+                            })
+
+        # 3c. Check if location is needed for in-person meeting (only if no conflicts)
         if result_json.get("need_location") and result_json.get("tasks"):
             # Return a question asking for the location instead of saving
             return jsonify({
