@@ -277,6 +277,7 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
 
         conflicts = []
         for row in rows:
+            row = dict(row)
             if not row['time']: continue
             existing_start = datetime.strptime(row['time'], "%H:%M")
             if row['end_time']:
@@ -350,15 +351,20 @@ SYSTEM_PROMPT = """
 
 **ДҮРЭМ:**
 1. **ХОУМ (PARSING):** Хэрэглэгчийн хүсэлтээс ажил эсвэл уулзалтын мэдээллийг (нэр, огноо, цаг, төрөл) зөв салгаж авна.
-2. **МЕНШИН (@):** Хэрэв текст дотор хүмүүсийн нэр (@username) байвал тэдгээрийг "for_users" жагсаалтад оруулна. 
-3. **ТӨЛӨВ (STATUS):** Хэрэв "for_users" дотор хүмүүс байвал "status" нь заавал "pending" байх ёстой. Зөвхөн хэрэглэгч өөртөө ажил нэмж байгаа тохиолдолд "approved" байна.
-4. **ХУВААРЬ:** Чи өөрөө хуваарь шалгах шаардлагагүй, зөвхөн хүсэлтийг JSON болгож хувиргахад анхаарна уу. 
-5. **ХАРИУ:** Хэрэв мэдээлэл асуусан бол (жишээ нь "Өнөөдөр юу хийх вэ?") "tasks" массив хоосон байна.
-6. **УУЛЗАЛТЫН ТӨРӨЛ:**
+2. **ЦАГ (TIME PARSING):** Цагийг заавал 24 цагийн форматаар (HH:mm) хөрвүүлнэ.
+   - "Х цагт" гэвэл заавал тухайн тоог шууд цаг болго: "5 цагт" → "05:00", "6 цагт" → "06:00", "13 цагт" → "13:00".
+   - "Х-аас Y цаг хүртэл" → time: "0X:00", end_time: "0Y:00".
+   - Зөвхөн "орой", "үдээс хойш", "pm" гэж тодорхой хэлсэн бол тоог 12-т нэм: "орой 5 цагт" → "17:00".
+   - "өглөө", "үүрийн" гэж хэлсэн бол тоог шууд ашигла: "өглөө 7" → "07:00".
+3. **МЕНШИН (@):** Хэрэв текст дотор хүмүүсийн нэр (@username) байвал тэдгээрийг "for_users" жагсаалтад оруулна. 
+4. **ТӨЛӨВ (STATUS):** Хэрэв "for_users" дотор хүмүүс байвал "status" нь заавал "pending" байх ёстой. Зөвхөн хэрэглэгч өөртөө ажил нэмж байгаа тохиолдолд "approved" байна.
+5. **ХУВААРЬ:** Чи өөрөө хуваарь шалгах шаардлагагүй, зөвхөн хүсэлтийг JSON болгож хувиргахад анхаарна уу. 
+6. **ХАРИУ:** Хэрэв мэдээлэл асуусан бол (жишээ нь "Өнөөдөр юу хийх вэ?") "tasks" массив хоосон байна.
+7. **УУЛЗАЛТЫН ТӨРӨЛ:**
    - "цахим уулзалт", "онлайн уулзалт", "видео уулзалт", "zoom", "meet", "online meeting" гэх мэт үгс байвал → "is_online_meeting": true, "location": "" гэж тохируул.
    - "уулзалт" гэх мэт биечлэн уулзах утгатай үгс байвал → "is_online_meeting": false. Хэрэв байршил (хаана уулзах?) хэлэгдээгүй бол "need_location": true гэж тохируул.
    - Ердийн ажлын даалгавар бол "is_online_meeting": false, "need_location": false.
-7. **Зөвхөн JSON.**
+8. **Зөвхөн JSON.**
 """
 
 # GOOGLE OAUTH CONFIG
@@ -606,29 +612,34 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
             attendees = []
             target_usernames = task.get('for_users', [])
             
-            conn_users = sqlite3.connect(DB_NAME, timeout=30)
-            conn_users.row_factory = sqlite3.Row
-            c_users = conn_users.cursor()
+            # Use dynamic DB connection (supports both SQLite and PostgreSQL)
+            conn_att, is_pg_att = get_db_connection()
+            p_att = "%s" if is_pg_att else "?"
+            c_att = conn_att.cursor()
             
             if target_usernames:
                 for tu in target_usernames:
                     clean_name = tu.replace("@", "").strip()
-                    c_users.execute("SELECT email FROM users WHERE LOWER(username) = LOWER(?)", (clean_name,))
-                    u_row = c_users.fetchone()
-                    if u_row and u_row['email']:
-                        attendees.append({'email': u_row['email']})
+                    c_att.execute(f"SELECT email FROM users WHERE LOWER(username) = LOWER({p_att})", (clean_name,))
+                    u_row = c_att.fetchone()
+                    if u_row:
+                        u_row = dict(u_row)
+                        if u_row.get('email'):
+                            attendees.append({'email': u_row['email']})
             
             # sender_email (хүсэлт явуулсан хүн)
             sender_id = task.get('created_by')
             if sender_id:
-                c_users.execute("SELECT email FROM users WHERE id = ?", (sender_id,))
-                sender_row = c_users.fetchone()
-                if sender_row and sender_row['email']:
-                    sender_email = sender_row['email']
-                    if not any(a['email'] == sender_email for a in attendees):
-                        attendees.append({'email': sender_email})
+                c_att.execute(f"SELECT email FROM users WHERE id = {p_att}", (sender_id,))
+                sender_row = c_att.fetchone()
+                if sender_row:
+                    sender_row = dict(sender_row)
+                    if sender_row.get('email'):
+                        sender_email = sender_row['email']
+                        if not any(a['email'] == sender_email for a in attendees):
+                            attendees.append({'email': sender_email})
                         
-            conn_users.close()
+            conn_att.close()
             
             if attendees:
                 event['attendees'] = attendees
@@ -1054,6 +1065,14 @@ def update_task_status(task_id):
             updated_task = c.fetchone()
             if updated_task:
                 task_copy['meet_link'] = updated_task['meet_link'] if is_pg else updated_task[0]
+            
+            # group_id ашиглан group доторх бусад хэрэглэгчийн username-г for_users-д нэмэх
+            # ингэснээр Google Calendar-д attendees зөв тохируулагдана
+            group_id = task.get('group_id')
+            if group_id:
+                c.execute(f'SELECT u.username FROM tasks t JOIN users u ON t.user_id = u.id WHERE t.group_id = {p} AND t.user_id != {p}', (group_id, task['user_id']))
+                other_users = c.fetchall()
+                task_copy['for_users'] = [dict(r)['username'] if is_pg else r[0] for r in other_users]
             
             create_google_calendar_event(task_copy, task['user_id'], task_id, generate_meet=False)
         except Exception as e:
