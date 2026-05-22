@@ -120,11 +120,13 @@ def is_time_conflict(user_id, date, start_time, end_time, exclude_group_id=None)
     if not user_id or not date or not start_time:
         return False
         
-    # Handle missing end_time by defaulting to 1 hour after start_time
+    # Handle missing end_time by defaulting to 30 mins after start_time
     if not end_time:
         try:
             h, m = map(int, start_time.split(':'))
-            end_time = f"{(h+1)%24:02d}:{m:02d}"
+            end_time = f"{h:02d}:{(m+30)%60:02d}"
+            if m + 30 >= 60:
+                end_time = f"{(h+1)%24:02d}:{(m+30)%60:02d}"
         except:
             end_time = start_time
 
@@ -134,7 +136,7 @@ def is_time_conflict(user_id, date, start_time, end_time, exclude_group_id=None)
 
     sql = f'''
         SELECT time, end_time FROM tasks
-        WHERE user_id = {p} AND date = {p} AND status = 'approved'
+        WHERE user_id = {p} AND date = {p} AND status != 'deleted'
     '''
     params = [user_id, date]
     
@@ -172,7 +174,7 @@ def is_time_conflict(user_id, date, start_time, end_time, exclude_group_id=None)
                 if existing_end <= existing_start:
                     existing_end += timedelta(days=1)
             else:
-                existing_end = existing_start + timedelta(hours=1)
+                existing_end = existing_start + timedelta(minutes=30)
 
             if (new_start < existing_end) and (new_end > existing_start):
                 return True
@@ -269,7 +271,7 @@ def parse_time_from_text(text):
         return to_24h(sh, sm or 0), to_24h(eh, em or 0)
 
     # Pattern: single time like "5 цагт"
-    single_pattern = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(?:цагт|цаг|:00)?', text)
+    single_pattern = re.search(r'(?<!\d)(\d{1,2})(?::(\d{2}))?\s*(?:цагт|цаг\b)', text)
     if single_pattern:
         sh, sm = single_pattern.groups()
         start = to_24h(sh, sm or 0)
@@ -311,7 +313,7 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
     c = conn.cursor()
     c.execute(f"""
         SELECT title, content, time, end_time FROM tasks
-        WHERE user_id = {p} AND date = {p} AND status = 'approved'
+        WHERE user_id = {p} AND date = {p} AND status != 'deleted'
     """, (user_id, date))
     rows = c.fetchall()
     conn.close()
@@ -319,7 +321,10 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
     if not end_time:
         try:
             h, m = map(int, start_time.split(":"))
-            end_time = f"{(h+1)%24:02d}:{m:02d}"
+            # Default to 30 mins if no end_time
+            end_time = f"{h:02d}:{(m+30)%60:02d}"
+            if m + 30 >= 60:
+                end_time = f"{(h+1)%24:02d}:{(m+30)%60:02d}"
         except:
             end_time = start_time
 
@@ -349,10 +354,15 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
                 if existing_end <= existing_start:
                     existing_end += timedelta(days=1)
             else:
-                existing_end = existing_start + timedelta(hours=1)
+                existing_end = existing_start + timedelta(minutes=30)
                 
             if (new_start < existing_end) and (new_end > existing_start):
-                conflicts.append({"title": existing_title, "content": existing_content})
+                conflicts.append({
+                    "title": existing_title, 
+                    "content": existing_content,
+                    "time": existing_time,
+                    "end_time": existing_end_time
+                })
         return conflicts
     except Exception as e:
         print(f"DEBUG: get_conflicting_tasks error: {e}")
@@ -942,7 +952,11 @@ def agent():
                         uid = u_row['id'] if is_pg else u_row[0]
                         conflicts = get_conflicting_tasks(uid, task.get('date'), task.get('time'), task.get('end_time'))
                         if conflicts:
-                            conflict_msgs = [f"Уучлаарай, @{clean_name} тухайн цагт '{c['title']}' ажилтай байна." for c in conflicts]
+                            conflict_msgs = []
+                            for c in conflicts:
+                                time_info = f" ({c['time']}-{c['end_time']})" if c.get('end_time') else f" ({c['time']})"
+                                conflict_msgs.append(f"Уучлаарай, @{clean_name} тухайн цагт{time_info} '{c['title']}' ажилтай байна.")
+                            
                             conn.close()
                             return jsonify({
                                 "summary": " ".join(conflict_msgs),
@@ -1003,8 +1017,17 @@ def agent():
                         # Бусад хүмүүст заавал pending байх ёстой
                         task_to_save['status'] = 'pending'
                         
-                        # save_task_to_db natively creates the event if status=='approved' (which it is for the Sender)
-                        task_id = save_task_to_db(task_to_save, uid, user_id)
+                    # ALWAYS SAVE for everyone
+                    task_id = save_task_to_db(task_to_save, uid, user_id)
+                    if not task_id:
+                        # This shouldn't happen usually because we checked conflicts above, 
+                        # but as a safety measure:
+                        conn.close()
+                        return jsonify({
+                            "summary": f"⚠️ @{uid} хэрэглэгч дээр цаг давхцаж байна.",
+                            "tasks": [],
+                            "available": False
+                        }), 409
                 
                 # If it was a scheduling request and success
                 if not result_json.get("summary") or result_json["summary"] == "Хүсэлтийн товч тайлбар":
