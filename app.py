@@ -881,14 +881,18 @@ def agent():
                         uid = u_row['id'] if is_pg else u_row[0]
                         target_user_ids.append((uid, clean_name))
 
+                task_has_conflict = False
+
                 # Check conflicts for each target user
                 for tid, tname in target_user_ids:
                     conflicts = get_conflicting_tasks(tid, task.get('date'), task.get('time'), task.get('end_time'))
+                    print(f"DEBUG: [agent] CHECKING tid={tid} date={task.get('date')} time={task.get('time')} - found conflicts: {len(conflicts)}")
                     if conflicts:
+                        task_has_conflict = True
                         for conf in conflicts:
-                            all_conflicts.append(f"Уучлаарай, @{tname} тухайн цагт '{conf['title']}' ({conf['content']}) ажилтай байгаа тул завгүй байна.")
+                            all_conflicts.append(f"Уучлаарай, @{tname} тухайн цагт '{conf['title']}' ({conf['content']}) ажилтай байна.")
                 
-                if not all_conflicts:
+                if not task_has_conflict:
                     enriched_tasks.append((task, [uid for uid, uname in target_user_ids]))
 
             if all_conflicts:
