@@ -146,6 +146,7 @@ def is_time_conflict(user_id, date, start_time, end_time, exclude_group_id=None)
     c.execute(sql, tuple(params))
 
     rows = c.fetchall()
+    print(f"DEBUG: [is_time_conflict] Found {len(rows)} potential conflicts for User {user_id} on {date}")
     conn.close()
 
     try:
@@ -158,11 +159,16 @@ def is_time_conflict(user_id, date, start_time, end_time, exclude_group_id=None)
              new_end += timedelta(days=1)
 
         for row in rows:
-            # Handle both list-like and dict-like rows
-            r_time = row['time'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[0]
-            r_end = row['end_time'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[1]
+            # More robust row access
+            try:
+                r_time = row['time'] if hasattr(row, 'keys') else row[0]
+                r_end = row['end_time'] if hasattr(row, 'keys') else row[1]
+            except:
+                r_time = row[0]
+                r_end = row[1]
             
             if not r_time: continue
+            print(f"DEBUG: [conflict_check] Comparing {start_time}-{end_time} with existing {r_time}-{r_end}")
             existing_start = datetime.strptime(r_time, "%H:%M")
             
             if r_end:
@@ -174,9 +180,10 @@ def is_time_conflict(user_id, date, start_time, end_time, exclude_group_id=None)
                 existing_end = existing_start + timedelta(hours=1)
 
             if (new_start < existing_end) and (new_end > existing_start):
+                print(f"DEBUG: [conflict_check] CONFLICT FOUND with {r_time}-{r_end}")
                 return True  # Давхцал байна
     except Exception as e:
-        print(f"Conflict check error: {e}")
+        print(f"DEBUG: [conflict_check] Logic Error: {e}")
         return False
 
     return False  # Давхцахгүй 
@@ -282,12 +289,17 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
 
         conflicts = []
         for row in rows:
-            r_time = row['time'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[2]
-            r_end = row['end_time'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[3]
-            r_title = row['title'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[0]
-            r_content = row['content'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[1]
+            # More robust row access for get_conflicting_tasks
+            try:
+                r_title = row['title'] if hasattr(row, 'keys') else row[0]
+                r_content = row['content'] if hasattr(row, 'keys') else row[1]
+                r_time = row['time'] if hasattr(row, 'keys') else row[2]
+                r_end = row['end_time'] if hasattr(row, 'keys') else row[3]
+            except:
+                r_title, r_content, r_time, r_end = row[0], row[1], row[2], row[3]
 
             if not r_time: continue
+            print(f"DEBUG: [get_conflicting_tasks] Comparing with {r_title} at {r_time}")
             existing_start = datetime.strptime(r_time, "%H:%M")
             if r_end:
                 existing_end = datetime.strptime(r_end, "%H:%M")
@@ -366,9 +378,10 @@ SYSTEM_PROMPT = """
 5. **ХАРИУ:** Хэрэв мэдээлэл асуусан бол (жишээ нь "Өнөөдөр юу хийх вэ?") "tasks" массив хоосон байна.
 6. **УУЛЗАЛТЫН ТӨРӨЛ:**
    - "цахим уулзалт", "онлайн уулзалт", "видео уулзалт", "zoom", "meet", "online meeting" гэх мэт үгс байвал → "is_online_meeting": true, "location": "" гэж тохируул.
-   - "уулзалт" гэх мэт биечлэн уулзах утгатай үгс байвал → "is_online_meeting": false. Хэрэв байршил (хаана уулзах?) хэлэгдээгүй бол "need_location": true гэж тохируул.
-   - Ердийн ажлын даалгавар бол "is_online_meeting": false, "need_location": false.
+   - "уулзалт", "уулзах", "ярилцах", "meeting" гэх мэт хүмүүстэй биечлэн уулзах утгатай үгс байвал → "is_online_meeting": false. Хэрэв байршил (хаана уулзах?) огт хэлэгдээгүй бол "need_location": true гэж тохируул.
+   - "ажил", "хийх", "унших", "бичих" гэх мэт ердийн ганцаараа хийх ажлын даалгавар бол "is_online_meeting": false, "need_location": false гэж тохируул.
 7. **Зөвхөн JSON.**
+8. **ОГНОО:** Хэрэв сар хэлээгүй бол өнөөдрийн сарыг ашигла.
 """
 
 # GOOGLE OAUTH CONFIG
