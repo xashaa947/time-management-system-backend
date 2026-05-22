@@ -229,6 +229,10 @@ def get_users():
     conn.close()
     return jsonify(users)
 
+def normalize_username(name):
+    if not name: return ""
+    return name.lower().replace("@", "").replace("-", "").replace("_", "").replace(" ", "")
+
 def get_mentioned_user_ids(user_text, db_cursor):
     """
     Хэрэглэгчийн текстээс @username-г олж, тухайн хэрэглэгчийн ID-г буцаана.
@@ -364,6 +368,7 @@ SYSTEM_PROMPT = """
    - "7-8:30" = "07:00-08:30"
    - "7-8" = "07:00-08:00"
    - Хэрэв "орой", "pm", "үдээс хойш" гэж бичээгүй бол өглөөний цаг гэж үз.
+10. **ХЭРЭГЛЭГЧИЙН НЭР:** "for_users" талбарт зөвхөн боломжит хэрэглэгчдийн жагсаалтад байгаа username-үүдийг яг байгаагаар нь ашигла.
 """
 
 # GOOGLE OAUTH CONFIG
@@ -878,13 +883,23 @@ def agent():
                         target_usernames = [uname]
                 
                 target_user_ids = []
+                c.execute("SELECT id, username FROM users")
+                all_users = c.fetchall()
+
                 for tu in target_usernames:
-                    clean_name = tu.replace("@", "").strip()
-                    c.execute(f"SELECT id FROM users WHERE LOWER(username) = LOWER({p})", (clean_name,))
-                    u_row = c.fetchone()
-                    if u_row:
-                        uid = u_row['id'] if is_pg else u_row[0]
-                        target_user_ids.append((uid, clean_name))
+                    clean_name = normalize_username(tu)
+                    for u in all_users:
+                        # Handle DictCursor vs Tuple
+                        try:
+                            db_id = u['id'] if hasattr(u, 'keys') else u[0]
+                            db_user = u['username'] if hasattr(u, 'keys') else u[1]
+                        except:
+                            db_id, db_user = u[0], u[1]
+                            
+                        if normalize_username(db_user) == clean_name:
+                            # Avoid appending duplicate user mappings
+                            if db_id not in [x[0] for x in target_user_ids]:
+                                target_user_ids.append((db_id, db_user))
 
                 task_has_conflict = False
 
