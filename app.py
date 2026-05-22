@@ -241,12 +241,22 @@ def get_mentioned_user_ids(user_text, db_cursor):
     db_cursor.execute("SELECT id, username FROM users")
     all_users = db_cursor.fetchall()
     user_ids = {}
-    lower_text = user_text.lower()
-    
-    for uid, username in all_users:
-        mention_tag = f"@{username.lower()}"
-        if mention_tag in lower_text:
+
+    normalized_text = normalize_username(user_text)
+
+    for row in all_users:
+        try:
+            uid = row['id']
+            username = row['username']
+        except:
+            uid = row[0]
+            username = row[1]
+
+        normalized_db_name = normalize_username(username)
+
+        if normalized_db_name in normalized_text:
             user_ids[uid] = username
+
     return user_ids 
 
 def get_conflicting_tasks(user_id, date, start_time, end_time=None):
@@ -280,18 +290,43 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
             new_end += timedelta(days=1)
 
         conflicts = []
+        
+        print("\n=== CONFLICT CHECK ===")
+        print("USER:", user_id)
+        print("DATE:", date)
+        print("START:", start_time)
+        print("END:", end_time)
+        print("ROWS:", len(rows))
+        
         for row in rows:
-            if not row['time']: continue
-            existing_start = datetime.strptime(row['time'], "%H:%M")
-            if row['end_time']:
-                existing_end = datetime.strptime(row['end_time'], "%H:%M")
+            try:
+                existing_time = row['time']
+                existing_end_time = row['end_time']
+                existing_title = row['title']
+                existing_content = row['content']
+            except:
+                existing_time = row[2]
+                existing_end_time = row[3]
+                existing_title = row[0]
+                existing_content = row[1]
+
+            if not existing_time:
+                continue
+
+            existing_start = datetime.strptime(existing_time, "%H:%M")
+            if existing_end_time:
+                existing_end = datetime.strptime(existing_end_time, "%H:%M")
                 if existing_end <= existing_start:
                     existing_end += timedelta(days=1)
             else:
                 existing_end = existing_start + timedelta(hours=1)
                 
             if (new_start < existing_end) and (new_end > existing_start):
-                conflicts.append({"title": row['title'], "content": row['content']})
+                print(f"CHECK {new_start.strftime('%H:%M')}-{new_end.strftime('%H:%M')} WITH {existing_start.strftime('%H:%M')}-{existing_end.strftime('%H:%M')} -> CONFLICT")
+                conflicts.append({"title": existing_title, "content": existing_content})
+            else:
+                print(f"CHECK {new_start.strftime('%H:%M')}-{new_end.strftime('%H:%M')} WITH {existing_start.strftime('%H:%M')}-{existing_end.strftime('%H:%M')} -> OK")
+                
         return conflicts
     except:
         return []
@@ -300,7 +335,14 @@ def admin_add_task():
     data = request.get_json()
     user_id = data.get("user_id")
     # Simple direct add
-    save_task_to_db(data, user_id, user_id)
+    task_id = save_task_to_db(data, user_id, user_id)
+    
+    if not task_id:
+        return jsonify({
+            "success": False,
+            "message": "Цаг давхцаж байна"
+        }), 409
+
     return jsonify({"success": True, "message": "Task added successfully"})
 
 # OpenAI client
