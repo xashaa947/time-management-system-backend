@@ -13,6 +13,7 @@ except ImportError:
     psycopg2 = None
 import json
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import google.oauth2.credentials
 import google_auth_oauthlib.flow
 from googleapiclient.discovery import build
@@ -778,7 +779,8 @@ def agent():
     if not user_text and not user_date and not user_time:
         return jsonify({"error": "Хүсэлт хоосон байна"}), 400
 
-    current_time_str = f"Өнөөдрийн огноо: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    mn_tz = ZoneInfo("Asia/Ulaanbaatar")
+    current_time_str = f"Өнөөдрийн огноо: {datetime.now(mn_tz).strftime('%Y-%m-%d %H:%M:%S')}"
     
     # Add explicit user hints if provided
     hints = ""
