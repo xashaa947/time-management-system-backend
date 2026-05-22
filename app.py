@@ -229,10 +229,6 @@ def get_users():
     conn.close()
     return jsonify(users)
 
-def normalize_username(name):
-    if not name: return ""
-    return name.lower().replace("@", "").replace("-", "").replace("_", "").replace(" ", "")
-
 def get_mentioned_user_ids(user_text, db_cursor):
     """
     Хэрэглэгчийн текстээс @username-г олж, тухайн хэрэглэгчийн ID-г буцаана.
@@ -241,22 +237,12 @@ def get_mentioned_user_ids(user_text, db_cursor):
     db_cursor.execute("SELECT id, username FROM users")
     all_users = db_cursor.fetchall()
     user_ids = {}
-
-    normalized_text = normalize_username(user_text)
-
-    for row in all_users:
-        try:
-            uid = row['id']
-            username = row['username']
-        except:
-            uid = row[0]
-            username = row[1]
-
-        normalized_db_name = normalize_username(username)
-
-        if normalized_db_name in normalized_text:
+    lower_text = user_text.lower()
+    
+    for uid, username in all_users:
+        mention_tag = f"@{username.lower()}"
+        if mention_tag in lower_text:
             user_ids[uid] = username
-
     return user_ids 
 
 def get_conflicting_tasks(user_id, date, start_time, end_time=None):
@@ -290,43 +276,18 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
             new_end += timedelta(days=1)
 
         conflicts = []
-        
-        print("\n=== CONFLICT CHECK ===")
-        print("USER:", user_id)
-        print("DATE:", date)
-        print("START:", start_time)
-        print("END:", end_time)
-        print("ROWS:", len(rows))
-        
         for row in rows:
-            try:
-                existing_time = row['time']
-                existing_end_time = row['end_time']
-                existing_title = row['title']
-                existing_content = row['content']
-            except:
-                existing_time = row[2]
-                existing_end_time = row[3]
-                existing_title = row[0]
-                existing_content = row[1]
-
-            if not existing_time:
-                continue
-
-            existing_start = datetime.strptime(existing_time, "%H:%M")
-            if existing_end_time:
-                existing_end = datetime.strptime(existing_end_time, "%H:%M")
+            if not row['time']: continue
+            existing_start = datetime.strptime(row['time'], "%H:%M")
+            if row['end_time']:
+                existing_end = datetime.strptime(row['end_time'], "%H:%M")
                 if existing_end <= existing_start:
                     existing_end += timedelta(days=1)
             else:
                 existing_end = existing_start + timedelta(hours=1)
                 
             if (new_start < existing_end) and (new_end > existing_start):
-                print(f"CHECK {new_start.strftime('%H:%M')}-{new_end.strftime('%H:%M')} WITH {existing_start.strftime('%H:%M')}-{existing_end.strftime('%H:%M')} -> CONFLICT")
-                conflicts.append({"title": existing_title, "content": existing_content})
-            else:
-                print(f"CHECK {new_start.strftime('%H:%M')}-{new_end.strftime('%H:%M')} WITH {existing_start.strftime('%H:%M')}-{existing_end.strftime('%H:%M')} -> OK")
-                
+                conflicts.append({"title": row['title'], "content": row['content']})
         return conflicts
     except:
         return []
@@ -335,14 +296,7 @@ def admin_add_task():
     data = request.get_json()
     user_id = data.get("user_id")
     # Simple direct add
-    task_id = save_task_to_db(data, user_id, user_id)
-    
-    if not task_id:
-        return jsonify({
-            "success": False,
-            "message": "Цаг давхцаж байна"
-        }), 409
-
+    save_task_to_db(data, user_id, user_id)
     return jsonify({"success": True, "message": "Task added successfully"})
 
 # OpenAI client
@@ -405,12 +359,6 @@ SYSTEM_PROMPT = """
    - "уулзалт" гэх мэт биечлэн уулзах утгатай үгс байвал → "is_online_meeting": false. Хэрэв байршил (хаана уулзах?) хэлэгдээгүй бол "need_location": true гэж тохируул.
    - Ердийн ажлын даалгавар бол "is_online_meeting": false, "need_location": false.
 7. **Зөвхөн JSON.**
-8. **ОГНОО:** Хэрэв сар хэлээгүй бол өнөөдрийн сарыг ашигла.
-9. **ЦАГИЙН ФОРМАТ:**
-   - "7-8:30" = "07:00-08:30"
-   - "7-8" = "07:00-08:00"
-   - Хэрэв "орой", "pm", "үдээс хойш" гэж бичээгүй бол өглөөний цаг гэж үз.
-10. **ХЭРЭГЛЭГЧИЙН НЭР:** "for_users" талбарт зөвхөн боломжит хэрэглэгчдийн жагсаалтад байгаа username-үүдийг яг байгаагаар нь ашигла.
 """
 
 # GOOGLE OAUTH CONFIG
@@ -925,36 +873,22 @@ def agent():
                         target_usernames = [uname]
                 
                 target_user_ids = []
-                c.execute("SELECT id, username FROM users")
-                all_users = c.fetchall()
-
                 for tu in target_usernames:
-                    clean_name = normalize_username(tu)
-                    for u in all_users:
-                        # Handle DictCursor vs Tuple
-                        try:
-                            db_id = u['id'] if hasattr(u, 'keys') else u[0]
-                            db_user = u['username'] if hasattr(u, 'keys') else u[1]
-                        except:
-                            db_id, db_user = u[0], u[1]
-                            
-                        if normalize_username(db_user) == clean_name:
-                            # Avoid appending duplicate user mappings
-                            if db_id not in [x[0] for x in target_user_ids]:
-                                target_user_ids.append((db_id, db_user))
-
-                task_has_conflict = False
+                    clean_name = tu.replace("@", "").strip()
+                    c.execute(f"SELECT id FROM users WHERE LOWER(username) = LOWER({p})", (clean_name,))
+                    u_row = c.fetchone()
+                    if u_row:
+                        uid = u_row['id'] if is_pg else u_row[0]
+                        target_user_ids.append((uid, clean_name))
 
                 # Check conflicts for each target user
                 for tid, tname in target_user_ids:
                     conflicts = get_conflicting_tasks(tid, task.get('date'), task.get('time'), task.get('end_time'))
-                    print(f"DEBUG: [agent] CHECKING tid={tid} date={task.get('date')} time={task.get('time')} - found conflicts: {len(conflicts)}")
                     if conflicts:
-                        task_has_conflict = True
                         for conf in conflicts:
-                            all_conflicts.append(f"Уучлаарай, @{tname} тухайн цагт '{conf['title']}' ({conf['content']}) ажилтай байна.")
+                            all_conflicts.append(f"Уучлаарай, @{tname} тухайн цагт '{conf['title']}' ({conf['content']}) ажилтай байгаа тул завгүй байна.")
                 
-                if not task_has_conflict:
+                if not all_conflicts:
                     enriched_tasks.append((task, [uid for uid, uname in target_user_ids]))
 
             if all_conflicts:
