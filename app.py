@@ -135,7 +135,7 @@ def is_time_conflict(user_id, date, start_time, end_time, exclude_group_id=None)
 
     sql = f'''
         SELECT time, end_time FROM tasks
-        WHERE user_id = {p} AND date = {p} AND status = 'approved'
+        WHERE user_id = {p} AND date = {p} AND (status = 'approved' OR status = 'pending')
     '''
     params = [user_id, date]
     
@@ -158,11 +158,15 @@ def is_time_conflict(user_id, date, start_time, end_time, exclude_group_id=None)
              new_end += timedelta(days=1)
 
         for row in rows:
-            if not row[0]: continue
-            existing_start = datetime.strptime(row[0], "%H:%M")
+            # Handle both list-like and dict-like rows
+            r_time = row['time'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[0]
+            r_end = row['end_time'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[1]
             
-            if row[1]:
-                existing_end = datetime.strptime(row[1], "%H:%M")
+            if not r_time: continue
+            existing_start = datetime.strptime(r_time, "%H:%M")
+            
+            if r_end:
+                existing_end = datetime.strptime(r_end, "%H:%M")
                 if existing_end <= existing_start:
                     existing_end += timedelta(days=1)
             else:
@@ -258,7 +262,7 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
     c = conn.cursor()
     c.execute(f"""
         SELECT title, content, time, end_time FROM tasks
-        WHERE user_id = {p} AND date = {p} AND status = 'approved'
+        WHERE user_id = {p} AND date = {p} AND (status = 'approved' OR status = 'pending')
     """, (user_id, date))
     rows = c.fetchall()
     conn.close()
@@ -278,17 +282,22 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
 
         conflicts = []
         for row in rows:
-            if not row['time']: continue
-            existing_start = datetime.strptime(row['time'], "%H:%M")
-            if row['end_time']:
-                existing_end = datetime.strptime(row['end_time'], "%H:%M")
+            r_time = row['time'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[2]
+            r_end = row['end_time'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[3]
+            r_title = row['title'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[0]
+            r_content = row['content'] if hasattr(row, '__getitem__') and isinstance(row, dict) else row[1]
+
+            if not r_time: continue
+            existing_start = datetime.strptime(r_time, "%H:%M")
+            if r_end:
+                existing_end = datetime.strptime(r_end, "%H:%M")
                 if existing_end <= existing_start:
                     existing_end += timedelta(days=1)
             else:
                 existing_end = existing_start + timedelta(hours=1)
                 
             if (new_start < existing_end) and (new_end > existing_start):
-                conflicts.append({"title": row['title'], "content": row['content']})
+                conflicts.append({"title": r_title, "content": r_content})
         return conflicts
     except:
         return []
