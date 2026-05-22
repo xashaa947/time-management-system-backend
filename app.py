@@ -687,28 +687,51 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
             p_att = "%s" if is_pg_att else "?"
             c_att = conn_att.cursor()
             
-            if target_usernames:
-                for tu in target_usernames:
-                    clean_name = tu.replace("@", "").strip()
-                    c_att.execute(f"SELECT email FROM users WHERE LOWER(username) = LOWER({p_att})", (clean_name,))
-                    u_row = c_att.fetchone()
-                    if u_row:
-                        u_mail = u_row['email'] if hasattr(u_row, 'keys') else u_row[0]
-                        if u_mail: attendees.append({'email': u_mail})
+            group_id = task.get('group_id')
+            if group_id:
+                # Find all users in this group who have 'approved' status
+                c_att.execute(f"""
+                    SELECT u.email 
+                    FROM tasks t
+                    JOIN users u ON t.user_id = u.id
+                    WHERE t.group_id = {p_att} AND t.status = 'approved'
+                """, (group_id,))
+                approved_rows = c_att.fetchall()
+                for ar in approved_rows:
+                    mail = ar['email'] if is_pg_att else ar[0]
+                    if mail and not any(a['email'] == mail for a in attendees):
+                        attendees.append({'email': mail})
+            else:
+                # Fallback for old tasks or single-user tasks with for_users
+                if target_usernames:
+                    for tu in target_usernames:
+                        clean_name = tu.replace("@", "").strip()
+                        c_att.execute(f"SELECT email FROM users WHERE LOWER(username) = LOWER({p_att})", (clean_name,))
+                        u_row = c_att.fetchone()
+                        if u_row:
+                            u_mail = u_row['email'] if is_pg_att else u_row[0]
+                            if u_mail: attendees.append({'email': u_mail})
             
             sender_id = task.get('created_by')
             if sender_id:
                 c_att.execute(f"SELECT email FROM users WHERE id = {p_att}", (sender_id,))
                 sender_row = c_att.fetchone()
                 if sender_row:
-                    s_mail = sender_row['email'] if hasattr(sender_row, 'keys') else sender_row[0]
+                    s_mail = sender_row['email'] if is_pg_att else sender_row[0]
                     if s_mail and not any(a['email'] == s_mail for a in attendees):
                         attendees.append({'email': s_mail})
                         
             conn_att.close()
             
             if attendees:
-                event['attendees'] = attendees
+                # Remove duplicates if any
+                unique_attendees = []
+                seen_emails = set()
+                for a in attendees:
+                    if a['email'] not in seen_emails:
+                        unique_attendees.append(a)
+                        seen_emails.add(a['email'])
+                event['attendees'] = unique_attendees
             
             event['reminders'] = {
                 'useDefault': False,
