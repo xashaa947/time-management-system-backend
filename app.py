@@ -699,12 +699,12 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
             
             group_id = task.get('group_id')
             if group_id:
-                # Find all users in this group who have 'approved' status
+                # Find all users in this group (include pending so they get invite)
                 c_att.execute(f"""
-                    SELECT u.email 
+                    SELECT DISTINCT u.email 
                     FROM tasks t
                     JOIN users u ON t.user_id = u.id
-                    WHERE t.group_id = {p_att} AND t.status = 'approved'
+                    WHERE t.group_id = {p_att}
                 """, (group_id,))
                 approved_rows = c_att.fetchall()
                 for ar in approved_rows:
