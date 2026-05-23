@@ -608,6 +608,9 @@ def google_callback():
         return jsonify({"error": "Google login failed, no email found"})
 
 def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True):
+    print(f"DEBUG: create_google_calendar_event called for task: {task.get('title')}")
+    print(f"DEBUG: is_online_meeting: {task.get('is_online_meeting')}")
+    
     conn, is_pg = get_db_connection()
     p = "%s" if is_pg else "?"
     c = conn.cursor()
@@ -755,6 +758,9 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
             conferenceDataVersion=1,
             sendUpdates='all'
         ).execute()
+        
+        print(f"DEBUG: Google Event Inserted: {json.dumps(event, indent=2)}")
+        
         event_id = event.get('id')
         meet_link = event.get('hangoutLink')
         
@@ -1063,19 +1069,19 @@ def agent():
                         # Бусад хүмүүст заавал pending байх ёстой
                         task_to_save['status'] = 'pending'
                         
-                        # ALWAYS SAVE for everyone
-                        task_id, meet_link = save_task_to_db(task_to_save, uid, user_id)
-                        if meet_link: final_meet_link = meet_link
-                        
-                        if not task_id:
-                            # This shouldn't happen usually because we checked conflicts above, 
-                            # but as a safety measure:
-                            conn.close()
-                            return jsonify({
-                                "summary": f"⚠️ @{uid} хэрэглэгч дээр цаг давхцаж байна.",
-                                "tasks": [],
-                                "available": False
-                            }), 409
+                    # ALWAYS SAVE for everyone
+                    task_id, meet_link = save_task_to_db(task_to_save, uid, user_id)
+                    if meet_link: final_meet_link = meet_link
+                    
+                    if not task_id:
+                        # This shouldn't happen usually because we checked conflicts above, 
+                        # but as a safety measure:
+                        conn.close()
+                        return jsonify({
+                            "summary": f"⚠️ @{uid} хэрэглэгч дээр цаг давхцаж байна.",
+                            "tasks": [],
+                            "available": False
+                        }), 409
                 
                 # If it was a scheduling request and success
                 if not result_json.get("summary") or result_json["summary"] == "Хүсэлтийн товч тайлбар":
