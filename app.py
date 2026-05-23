@@ -216,13 +216,17 @@ def save_task_to_db(task, user_id=None, created_by=None):
     conn.close()
     
     # Try to sync to Google Calendar if task is approved
+    res = None
     if task.get('status', 'approved') == 'approved':
         try:
             task['created_by'] = created_by
-            create_google_calendar_event(task, user_id, task_id)
+            res = create_google_calendar_event(task, user_id, task_id)
         except Exception as e:
             print(f"Calendar Sync failed: {e}")
-    return task_id
+            
+    # Return both task_id and meet_link (if any)
+    meet_link = res.get('meet_link') if res and isinstance(res, dict) else None
+    return task_id, meet_link
 
 
 
@@ -271,7 +275,7 @@ def parse_time_from_text(text):
         return to_24h(sh, sm or 0), to_24h(eh, em or 0)
 
     # Pattern: single time like "5 цагт"
-    single_pattern = re.search(r'(?<!\d)(\d{1,2})(?::(\d{2}))?\s*(?:цагт|цаг\b)', text)
+    single_pattern = re.search(r'(?<!\d)(\d{1,2})(?::(\d{2}))?\s*(?:цагт|цаг\b|tsagt|tsagiin)', text)
     if single_pattern:
         sh, sm = single_pattern.groups()
         start = to_24h(sh, sm or 0)
@@ -312,7 +316,7 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
     p = "%s" if is_pg else "?"
     c = conn.cursor()
     c.execute(f"""
-        SELECT title, content, time, end_time FROM tasks
+        SELECT title, content, time, end_time, status FROM tasks
         WHERE user_id = {p} AND date = {p} AND status != 'deleted'
     """, (user_id, date))
     rows = c.fetchall()
@@ -361,7 +365,8 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
                     "title": existing_title, 
                     "content": existing_content,
                     "time": existing_time,
-                    "end_time": existing_end_time
+                    "end_time": existing_end_time,
+                    "status": row['status'] if is_pg else row[4]
                 })
         return conflicts
     except Exception as e:
@@ -371,10 +376,10 @@ def get_conflicting_tasks(user_id, date, start_time, end_time=None):
 def admin_add_task():
     data = request.get_json()
     user_id = data.get("user_id")
-    task_id = save_task_to_db(data, user_id, user_id)
+    task_id, meet_link = save_task_to_db(data, user_id, user_id)
     if not task_id:
         return jsonify({"success": False, "message": "Цаг давхцаж байна"}), 409
-    return jsonify({"success": True, "message": "Task added successfully"})
+    return jsonify({"success": True, "message": "Task added successfully", "meet_link": meet_link})
 
 # OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -432,10 +437,11 @@ SYSTEM_PROMPT = """
 4. **ХУВААРЬ:** Чи өөрөө хуваарь шалгах шаардлагагүй, зөвхөн хүсэлтийг JSON болгож хувиргахад анхаарна уу. 
 5. **ХАРИУ:** Хэрэв мэдээлэл асуусан бол (жишээ нь "Өнөөдөр юу хийх вэ?") "tasks" массив хоосон байна.
 6. **УУЛЗАЛТЫН ТӨРӨЛ:**
-   - "цахим уулзалт", "онлайн уулзалт", "видео уулзалт", "zoom", "meet", "online meeting" гэх мэт үгс байвал → "is_online_meeting": true, "location": "" гэж тохируул.
-   - "уулзалт" гэх мэт биечлэн уулзах утгатай үгс байвал → "is_online_meeting": false. Хэрэв байршил (хаана уулзах?) хэлэгдээгүй бол "need_location": true гэж тохируул.
+   - "цахим уулзалт", "онлайн уулзалт", "видео уулзалт", "zoom", "meet", "online meeting", "tsahim uulzalt", "videoconference" гэх мэт үгс байвал → "is_online_meeting": true, "location": "" гэж тохируул.
+   - "уулзалт", "uulzalt", "meeting" гэх мэт биечлэн уулзах утгатай үгс байвал → "is_online_meeting": false. Хэрэв байршил (хаана уулзах?) хэлэгдээгүй бол "need_location": true гэж тохируул.
    - Ердийн ажлын даалгавар бол "is_online_meeting": false, "need_location": false.
 7. **Зөвхөн JSON.**
+8. **Хэл:** Хэрэглэгч латин галигаар бичсэн бол (жишээ нь: "uulzalt" эсвэл "tsahim") тэдгээрийг зөв ойлгож "is_online_meeting" болон "tasks.title"-ийг онооно.
 """
 
 # GOOGLE OAUTH CONFIG
@@ -657,7 +663,8 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
         location = task.get('location', '')
         title_lower = task.get('title', '').lower()
         type_lower = task.get('type', '').lower()
-        is_any_meeting = is_online or 'уулзалт' in title_lower or 'уулзалт' in type_lower
+        # Romanized uulzalt/meeting detection
+        is_any_meeting = is_online or any(w in title_lower or w in type_lower for w in ['уулзалт', 'uulzalt', 'meeting'])
 
         if is_online or (is_any_meeting and generate_meet):
             if generate_meet:
@@ -751,6 +758,14 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
         event_id = event.get('id')
         meet_link = event.get('hangoutLink')
         
+        # Robust meet link extraction
+        if not meet_link and event.get('conferenceData'):
+            entry_points = event['conferenceData'].get('entryPoints', [])
+            for ep in entry_points:
+                if ep.get('entryPointType') == 'video':
+                    meet_link = ep.get('uri')
+                    break
+        
         # Store the event ID in the database for this specific task
         if task_id:
             # Reopen connection for update
@@ -772,7 +787,7 @@ def create_google_calendar_event(task, user_id, task_id=None, generate_meet=True
             conn.commit()
             conn.close()
         
-        return event.get('htmlLink')
+        return {"calendar_link": event.get('htmlLink'), "meet_link": meet_link}
     except Exception as e:
         error_str = str(e)
         if "invalid_grant" in error_str or "expired" in error_str:
@@ -862,17 +877,22 @@ def agent():
         import uuid
         group_id = str(uuid.uuid4())
         saved_any = False
+        final_meet_link = None
         for uid in target_user_ids:
             task_to_save = pending.copy()
             task_to_save["group_id"] = group_id
             task_to_save["status"] = "approved" if uid == user_id else "pending"
-            task_id = save_task_to_db(task_to_save, uid, user_id)
+            task_id, meet_link = save_task_to_db(task_to_save, uid, user_id)
             if task_id:
                 saved_any = True
+                if meet_link: final_meet_link = meet_link
 
         conn.close()
         summary = f"✅ '{pending.get('title', 'Уулзалт')}' — {location}-д амжилттай товлогдлоо." if saved_any else "Давхцал байгаа тул хадгалагдсангүй."
-        return jsonify({"summary": summary, "tasks": [pending], "available": saved_any})
+        if final_meet_link:
+            summary += f"\nGoogle Meet: {final_meet_link}"
+            
+        return jsonify({"summary": summary, "tasks": [pending], "available": saved_any, "meet_link": final_meet_link})
     # ─────────────────────────────────────────────────────────────────────────
 
     if not user_text and not user_date and not user_time:
@@ -907,7 +927,8 @@ def agent():
             conflict_messages = []
             for uname, tasks in all_conflicts.items():
                 for t in tasks:
-                    status_text = f"Уучлаарай, @{uname} тухайн цагт '{t['title']}' ({t['content']}) ажилтай байгаа тул завгүй байна."
+                    status_desc = "ажилтай" if t.get('status') == 'approved' else "хүлээгдэж буй (tentative) хүсэлттэй"
+                    status_text = f"Уучлаарай, @{uname} тухайн цагт '{t['title']}' ({t['content']}) {status_desc} байгаа тул завгүй байна."
                     conflict_messages.append(status_text)
             conn.close()
             return jsonify({
@@ -978,7 +999,8 @@ def agent():
                             conflict_msgs = []
                             for c in conflicts:
                                 time_info = f" ({c['time']}-{c['end_time']})" if c.get('end_time') else f" ({c['time']})"
-                                conflict_msgs.append(f"Уучлаарай, @{clean_name} тухайн цагт{time_info} '{c['title']}' ажилтай байна.")
+                                status_desc = "ажилтай" if c.get('status') == 'approved' else "хүлээгдэж буй (tentative) хүсэлттэй"
+                                conflict_msgs.append(f"Уучлаарай, @{clean_name} тухайн цагт{time_info} '{c['title']}' {status_desc} байна.")
                             
                             conn.close()
                             return jsonify({
@@ -1001,6 +1023,7 @@ def agent():
         # 4. Save Logic (Already cleared conflicts in 3b)
         if "tasks" in result_json and result_json["tasks"]:
             enriched_tasks = []
+            final_meet_link = None
             for task in result_json["tasks"]:
                 target_usernames = task.get("for_users", [])
                 if not target_usernames:
@@ -1040,21 +1063,27 @@ def agent():
                         # Бусад хүмүүст заавал pending байх ёстой
                         task_to_save['status'] = 'pending'
                         
-                    # ALWAYS SAVE for everyone
-                    task_id = save_task_to_db(task_to_save, uid, user_id)
-                    if not task_id:
-                        # This shouldn't happen usually because we checked conflicts above, 
-                        # but as a safety measure:
-                        conn.close()
-                        return jsonify({
-                            "summary": f"⚠️ @{uid} хэрэглэгч дээр цаг давхцаж байна.",
-                            "tasks": [],
-                            "available": False
-                        }), 409
+                        # ALWAYS SAVE for everyone
+                        task_id, meet_link = save_task_to_db(task_to_save, uid, user_id)
+                        if meet_link: final_meet_link = meet_link
+                        
+                        if not task_id:
+                            # This shouldn't happen usually because we checked conflicts above, 
+                            # but as a safety measure:
+                            conn.close()
+                            return jsonify({
+                                "summary": f"⚠️ @{uid} хэрэглэгч дээр цаг давхцаж байна.",
+                                "tasks": [],
+                                "available": False
+                            }), 409
                 
                 # If it was a scheduling request and success
                 if not result_json.get("summary") or result_json["summary"] == "Хүсэлтийн товч тайлбар":
                     result_json["summary"] = "Хүсэлтийг амжилттай товлолоо."
+                
+                if final_meet_link:
+                    result_json["summary"] += f"\nGoogle Meet: {final_meet_link}"
+                    result_json["meet_link"] = final_meet_link
         
         return jsonify(result_json)
 
